@@ -1,0 +1,70 @@
+# =============================================================================
+# config.yml
+# Single source of truth for the pipeline. Every script (wrangle, analysis,
+# tests) reads from here so that swapping the actigraphy algorithm, the feature
+# set, or the GMM settings is a one-line edit rather than a code change.
+#
+# Paths are repo-relative; resolve them against here::here() in load_config().
+# Keep machine-specific absolute paths in an untracked config.local.yml.
+# =============================================================================
+
+default:
+
+  # ---- I/O (repo-relative) ----
+  paths:
+    data_raw:        "data/raw"          # untracked; place downloaded study data here
+    data_processed:  "data/processed"    # untracked; pipeline writes the analytic file here
+    results:         "results"
+    figures:         "figures"
+
+  # ---- Raw source files / folders (relative to data_raw) ----
+  sources:
+    redcap_csv:        "BBRF REDCap raw data OHSU 2.19.2026.csv"
+    ema_long_csv:      "Output/EMA_Data/Combined_BBRF_EMA_Data_Responses_2.19.2026_long.csv"
+    ema_gonogo_dir:    "Output/EMA_Data"            # per-subject *_GoNoGo_SummaryScores.csv
+    ema_gonogo_glob:   "GoNoGo_Summary"             # filename pattern to match
+    actigraphy_root:   "Actigraphy Data/CSV Files"  # algorithm subfolder appended below
+
+  # ---- Actigraphy algorithm (swappable: "Sadeh" or "Cole-Kripke") ----
+  actigraphy:
+    algorithm:   "Sadeh"     # -> reads from <actigraphy_root>/Sadeh
+    header_skip: 5           # leading metadata rows to skip in each actigraphy CSV
+
+  # ---- Sample handling ----
+  sample:
+    exclude_ids:   ["SleepBD21"]   # excluded by protocol; SleepBD08 lacks actigraphy (handled per missingness rule)
+    exclude_day_1: true            # day 1 = onboarding/partial; drop before modeling
+
+  # ---- GMM feature set (INPUTS to the mixture; continuous only) ----
+  # These define the latent daily states. SI/SB are NOT inputs; they overlay.
+  features:
+    - depression          # 0-100 slider
+    - anxiety             # 0-100 slider
+    - sleep_eff           # actigraphy sleep efficiency
+    - hrs_to_sleep        # actigraphy sleep onset timing (hours from 15:00 anchor)
+    - commission_elogit   # empirical-logit-transformed commission-error rate
+    - rt_cv               # go/no-go reaction-time variability
+
+  # ---- Feature transforms applied before standardization ----
+  transforms:
+    empirical_logit: ["commission"]   # bounded proportion -> real line
+    zscore_all: true                  # z-score every feature before fitting
+
+  # ---- SI / SB overlay variables (used to CHARACTERIZE states, not to fit) ----
+  overlay:
+    primary:   ["si_any", "si_severity"]
+    secondary: ["si_bother"]
+    rare:      ["ACTIVESIWITHINTENT", "SELFHARM", "SUICIDEATTEMPT"]
+
+  # ---- GMM / EM settings ----
+  gmm:
+    k_range:     [1, 2, 3, 4, 5, 6]
+    n_restarts:  30
+    max_iter:    500
+    tol:         1.0e-6
+    ridge:       1.0e-4     # covariance regularization (lambda * I)
+    seed:        123
+
+  # ---- Dynamics (Stage 3) settings ----
+  dynamics:
+    ews_window:  3          # rolling window (days) for variance / lag-1 autocorrelation

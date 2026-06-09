@@ -1,6 +1,40 @@
+# =============================================================================
+# .gitignore
+# CRITICAL DATA-SAFETY POLICY:
+#   This study contains identifiable, IRB-protected daily suicide/self-harm EMA
+#   plus geolocation. NO participant-level data may ever enter version control.
+#   We ignore the entire data/ tree and any participant-level result/figure
+#   artifacts. Commit ONLY code, documentation, the config template, and
+#   non-identifiable synthetic/simulated example data.
+# =============================================================================
+
+# Raw and processed data (never commit)
+data/
+!data/.gitkeep
+*.csv
+*.rds
+*.iqdat
+*.xlsx
+*.xls
+
+# Renv
+renv/library/
+renv/staging/
+
+# Results / figures that may contain participant-level info
+results/
+figures/
+!results/.gitkeep
+!figures/.gitkeep
+
+# Local config that may contain absolute machine paths
+config.local.yml
+config.yml
+
 # History files
 .Rhistory
 .Rapp.history
+.Rprofile
 
 # Session Data files
 .RData

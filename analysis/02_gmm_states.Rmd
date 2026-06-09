@@ -1,0 +1,199 @@
+---
+title: "BBRF GMM: Latent Daily Psychophysiological States & Suicide Risk"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: false
+params:
+  profile: "default"
+---
+
+```{r global, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, comment = "")
+```
+
+```{r environment, message = FALSE}
+
+## Load packages, source code, and config ##
+suppressPackageStartupMessages({
+  library(here);
+  library(dplyr);
+  library(readr);
+  library(tidyr);
+  library(ggplot2);
+  library(purrr);
+  library(glue)
+})
+
+#0.1 Source the from-scratch model code and shared utilities
+source(here::here("R", "utils.R"))
+source(here::here("R", "gmm_em.R"))
+
+#0.2 Load config (single source of truth) and set the seed
+cfg <- load_config(profile = params$profile)
+set.seed(cfg$gmm$seed)
+
+#0.3 Read the analytic person-day table built by R/01_build_dataset.R
+daily_path <- list.files(cfg$paths$data_processed, pattern = "^ema_daily",
+                         full.names = TRUE) |> sort() |> dplyr::last()
+
+daily <- readr::read_csv(daily_path, show_col_types = FALSE)
+
+```
+
+## Analysis Overview
+
+Goal is to discover latent daily states from a small set of continuous
+psychophysiological features (i.e., mood, actigraphy derived sleep, go/no-go cognition) by
+fitting a Gaussian Mixture Model via EM, then characterize those states by their
+suicidal-ideation profiles and analyze how individuals move among them over time.
+
+**This will occur in three stages.**
+
+1. *Univariate EM (EDA + code stepping-stone).* Fit a 1-D GMM to each feature to
+   inspect multimodality before committing to the joint model
+2. *Multivariate GMM (the model).* Fit the joint mixture, select K by BIC with
+   multi-restart stability, and guard against person-identity artifacts
+3. *States + dynamics.* Overlay SI/SB onto states; decode per-person state
+   sequences; relate early-warning indicators (variance, lag-1 autocorrelation)
+   to transitions into high-SI states
+
+```{r prepare-features}
+
+## 1. Build the standardized feature matrix (complete cases) ##
+
+#1.1 Pull the configured GMM input features
+feat <- cfg$features
+stopifnot(all(feat %in% names(daily)))
+
+#1.2 Complete-case person-days across the feature set (report the retained N)
+model_df <- daily |>
+  dplyr::select(subject, day, dplyr::all_of(feat),
+                dplyr::any_of(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare))) |>
+  tidyr::drop_na(dplyr::all_of(feat))
+
+message(glue::glue(
+  "Modeling on {nrow(model_df)} complete person-days ",
+  "across {dplyr::n_distinct(model_df$subject)} subjects ",
+  "(of {nrow(daily)} total person-days)."
+))
+
+#1.3 Standardize features (z-score); keep person id aligned for the artifact check
+X <- zscore_matrix(model_df[, feat])
+person_id <- model_df$subject
+
+```
+
+## 1. Univariate EM (per-feature multimodality)
+
+```{r univariate-em}
+
+## Fit a 2-component 1-D GMM to each feature as exploratory structure check ##
+
+uni_fits <- purrr::map(feat, function(v) {
+  x <- model_df[[v]]
+  x <- x[is.finite(x)]
+  gmm_em_fit_1d(x, K = 2L, n_restarts = cfg$gmm$n_restarts, seed = cfg$gmm$seed)
+})
+names(uni_fits) <- feat
+
+#1.1 Summarize each feature's recovered component means / weights
+uni_summary <- purrr::imap_dfr(uni_fits, function(f, nm) {
+  data.frame(feature = nm,
+             mu_1 = sort(f$mu)[1], mu_2 = sort(f$mu)[2],
+             weight_min = min(f$weights))
+})
+
+knitr::kable(uni_summary, digits = 3, caption = "Univariate 2-component summaries")
+
+```
+
+## 2. Multivariate GMM + model selection
+
+```{r select-k}
+
+## Fit across K and select by BIC (with multi-restart stability) ##
+
+sel <- gmm_select_k(
+  X,
+  k_range = unlist(cfg$gmm$k_range),
+  n_restarts = cfg$gmm$n_restarts,
+  max_iter = cfg$gmm$max_iter,
+  tol = cfg$gmm$tol,
+  ridge = cfg$gmm$ridge,
+  seed = cfg$gmm$seed)
+
+knitr::kable(sel$bic_table, digits = 1, caption = "Model selection across K (BIC)")
+message("BIC-selected K = ", sel$best_k)
+
+#2.1 BIC curve (decluttered)
+ggplot(sel$bic_table, aes(x = K, y = bic)) +
+  geom_line(colour = "grey60") +
+  geom_point(size = 2) +
+  geom_point(data = subset(sel$bic_table, K == sel$best_k),
+             colour = state_palette(1), size = 3.5) +
+  labs(title = "BIC by number of states", x = "K (states)", y = "BIC") +
+  theme_swd()
+
+best <- sel$best_fit
+
+```
+
+```{r artifact-check}
+
+## 2.2 Person x state check: is any state just one person's days? ##
+
+chk <- gmm_person_state_check(best, person_id)
+art <- data.frame(state = seq_along(chk$max_person_share),
+                  n_days = as.integer(chk$state_totals),
+                  max_single_person_share = round(chk$max_person_share, 3))
+
+knitr::kable(art, caption = "Per-state size and single-person dominance (high share => artifact)")
+
+```
+
+## 3. State characterization, SI overlay, and dynamics
+
+```{r state-overlay}
+
+## 3.1 MAP-assign states and overlay SI prevalence per state ##
+
+model_df$state <- factor(gmm_map_assign(best))
+
+overlay_vars <- intersect(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare),
+                          names(model_df))
+state_profile <- model_df |>
+  dplyr::group_by(state) |>
+  dplyr::summarise(
+    n_days = dplyr::n(),
+    dplyr::across(dplyr::all_of(overlay_vars), ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop")
+
+knitr::kable(state_profile, digits = 3, caption = "SI/SB profile by latent state")
+
+```
+
+```{r dynamics, eval = FALSE}
+
+## 3.2 Dynamics (Stage 3): per-person state sequences + early-warning signals ##
+# TODO (needs real data): for each subject, order states by `day`, then compute
+#   - dwell times and transition frequencies among states
+#   - rolling variance and lag-1 autocorrelation of each feature in the window
+#     preceding transitions INTO high-SI states (critical slowing down, Scheffer)
+# This is where the trajectory/dynamical-systems story is recovered from the
+# (otherwise day-exchangeable) Gaussian mixture.
+
+```
+
+## Limitations
+
+- Person-days are not independent (within-person autocorrelation; clustering in
+  ~32 people); the GMM likelihood treats them as exchangeable. Mitigations: the
+  person x state artifact check above, and a planned person-mean-centered fit
+  (`person_center()`) isolating within-person state structure.
+- Actigraphy was processed with the Sadeh algorithm for most but not all
+  participants; the algorithm is a one-line config swap for a Cole-Kripke
+  sensitivity analysis.
+- If BIC prefers K = 1 or states reduce to person identity, that is itself a
+  reportable finding about the (lack of) shared multivariate state structure.
