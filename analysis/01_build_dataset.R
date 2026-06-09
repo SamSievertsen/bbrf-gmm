@@ -90,23 +90,21 @@ clean_actigraphy <- function(actig) {
     dplyr::rename(
       sleep_onsetdate = `Onset Date`,
       sleep_onsettime = `Onset Time`,
-      sleep_latency   = `Latency`,
-      sleep_totmoves  = `Total Counts`,
-      sleep_eff       = `Efficiency`,
-      sleep_totalmin  = `Total Sleep Time (TST)`,
-      awakenings      = `Number of Awakenings`,
-      wakelengths     = `Average Awakening Length`,
-      sleep_fragidx   = `Sleep Fragmentation Index`,
-      bedtime_totalmin = `Total Minutes in Bed`
-    ) %>%
+      sleep_latency = `Latency`,
+      sleep_totmoves = `Total Counts`,
+      sleep_eff = `Efficiency`,
+      sleep_totalmin = `Total Sleep Time (TST)`,
+      awakenings = `Number of Awakenings`,
+      wakelengths = `Average Awakening Length`,
+      sleep_fragidx = `Sleep Fragmentation Index`,
+      bedtime_totalmin = `Total Minutes in Bed`) %>%
     dplyr::group_by(subject) %>%
     dplyr::arrange(`In Bed Date`, `In Bed Time`, .by_group = TRUE) %>%
     dplyr::mutate(
-      in_bed_dt  = lubridate::mdy_hms(paste(`In Bed Date`, `In Bed Time`), tz = "UTC"),
+      in_bed_dt = lubridate::mdy_hms(paste(`In Bed Date`, `In Bed Time`), tz = "UTC"),
       out_bed_dt = lubridate::mdy_hms(paste(`Out Bed Date`, `Out Bed Time`), tz = "UTC"),
       in_bed_mid = in_bed_dt + (out_bed_dt - in_bed_dt) / 2,
-      next_in_bed_mid = dplyr::lead(in_bed_mid)
-    ) %>%
+      next_in_bed_mid = dplyr::lead(in_bed_mid)) %>%
     dplyr::ungroup()
 }
 
