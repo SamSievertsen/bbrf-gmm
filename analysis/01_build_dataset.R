@@ -2,11 +2,11 @@
 # 01_build_dataset.R
 # Build the analytic person-day dataset for the GMM from raw BBRF sources.
 #
-# This is a clean, config-driven re-implementation of the data-core wrangle
-# (originally by Dani Y. Del Rubin & Scott A. Jones). It reproduces the substantive logic, i.e.,
-# joining the daily EMA survey, the daily go/no-go summaries, and actigraphy data,
-# but with modular helpers, dynamic output naming, and a single config switch
-# for the actigraphy algorithm (Sadeh <-> Cole-Kripke).
+# This is a clean, config-driven re-implementation of the data wrangle
+# (originally by Dani Y. Del Rubin & Scott A. Jones). It reproduces the substantive
+# logic, i.e., joining the daily EMA survey, the daily go/no-go summaries, and
+# actigraphy data,but with modular helpers, dynamic output naming, and a single
+# config switch for the actigraphy algorithm (Sadeh <-> Cole-Kripke).
 #
 # STATUS: v1. The numerical/EM core (gmm_em.R) is unit-tested; THIS script has
 # not yet been run against the real files and will need a local pass to confirm
@@ -44,6 +44,7 @@ actig_dir <- file.path(RAW, cfg$sources$actigraphy_root, cfg$actigraphy$algorith
 #1.1 Load the long-format EMA survey (one row per completed survey/person-day)
 load_ema_long <- function(path) {
   readr::read_csv(path, show_col_types = FALSE) %>%
+    
     #1.1.1 Standardize the known REDCap-side typo so downstream names are clean
     dplyr::rename_with(~ stringr::str_replace(., "^ACITVESUICIDALTHOUGHTS$",
                                               "ACTIVESUICIDALTHOUGHTS"))
@@ -68,6 +69,7 @@ load_actigraphy <- function(dir, skip) {
   files <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
   if (length(files) == 0L) stop("No actigraphy CSVs found in ", dir)
   purrr::map_dfr(files, function(f) {
+    
     #1.3.1 Subject = filename minus extension, multi-part suffixes, and algo tag
     subj <- basename(f) %>%
       stringr::str_remove("\\.csv$") %>%
@@ -130,117 +132,195 @@ align_actigraphy_to_day <- function(actig, ema) {
 
 ## 3. EMA survey cleaning ##
 
-#3.1 12-hour clock disambiguation for self-reported sleep/wake/nap times.
-#    Respondents enter times without AM/PM, so a "night" sleep time of 09:00 is
-#    really 21:00. We shift by 12h when a time falls in the implausible window
-#    for its context. THIS IS THE HIGHEST-RISK HELPER -- validate against known
-#    cases (and against actigraphy in-bed times) before trusting it.
-correct_clock <- function(t, context = c("night", "morning", "day")) {
-  context <- match.arg(context)
-  t <- hms::as_hms(t)
-  if (is.na(t)) return(t)
-  shift <- switch(
-    context,
-    #3.1.1 Night sleep time landing in daytime 06:00-18:00 -> add 12h
-    night   = (t > hms::as_hms("06:00:00")) & (t < hms::as_hms("18:00:00")),
-    #3.1.2 Morning wake time landing in evening/late -> add 12h
-    morning = (t >= hms::as_hms("16:00:00")) | (t <= hms::as_hms("02:00:00")),
-    #3.1.3 Daytime nap landing overnight -> add 12h
-    day     = (t < hms::as_hms("06:00:00")) | (t > hms::as_hms("22:00:00"))
-  )
-  if (isTRUE(shift)) hms::as_hms((as.numeric(t) + 12 * 3600) %% (24 * 3600)) else t
+#3.0 Parse a free-text clock value to hms. The EMA records times on an explicit
+#    12-hour clock WITH AM/PM (e.g., "12:00 AM", "11:00 PM"), so we parse that
+#    format directly -- NO heuristic AM/PM disambiguation is needed or wanted.
+#    Sentinels (e.g., "True") -> NA; a 24-hour fallback catches any stragglers
+#    so unexpected entries are never silently dropped. Vectorized over a column.
+parse_clock <- function(t) {
+  
+  #3.0.1 Non-character (already hms/numeric/difftime): coerce straight through
+  if (!is.character(t)) {
+    return(tryCatch(hms::as_hms(t),
+                    error = function(e) hms::as_hms(rep(NA_real_, length(t)))))
+  }
+  
+  #3.0.2 Blank out known sentinels / empties before parsing
+  t[t %in% c("", "True", "False", "NA", "NaN")] <- NA_character_
+  
+  #3.0.3 Helper: parse with a given format and return seconds-since-midnight
+  to_secs <- function(x, fmt) {
+    p <- strptime(x, format = fmt, tz = "UTC")
+    p$hour * 3600 + p$min * 60 + p$sec
+  }
+  
+  #3.0.4 Primary parse: 12-hour clock with AM/PM (case-insensitive; trims spaces)
+  secs <- to_secs(toupper(trimws(t)), "%I:%M %p")
+  
+  #3.0.5 Defensive 24-hour fallbacks for any non-sentinel value that didn't match
+  missed <- is.na(secs) & !is.na(t)
+  
+  if (any(missed)) secs[missed] <- to_secs(t[missed], "%H:%M:%S")
+  
+  missed <- is.na(secs) & !is.na(t)
+  
+  if (any(missed)) secs[missed] <- to_secs(t[missed], "%H:%M")
+  
+  hms::as_hms(secs)
 }
 
-#3.2 Hours-from-anchor for a continuous "how late to bed" measure. Anchoring at
+#3.1 Hours-from-anchor for a continuous "how late to bed" measure. Anchoring at
 #    15:00 avoids the midnight wrap that makes very-early and very-late onset
-#    look identical on a raw clock.
+#    look identical on a raw clock. Vectorized + NA-safe via parse_clock()
 hours_from_anchor <- function(t, anchor = "15:00:00") {
-  t <- hms::as_hms(t)
-  (as.numeric(t) - as.numeric(hms::as_hms(anchor))) %% (24 * 3600) / 3600
+  secs <- as.numeric(parse_clock(t))
+  (secs - as.numeric(hms::as_hms(anchor))) %% (24 * 3600) / 3600
 }
 
-#3.3 Clean the EMA survey: recode binary SI items to 0/1, build SI composites,
+#3.2 Clean the EMA survey: recode binary SI items to 0/1, build SI composites,
 #    correct sleep/wake times, and derive continuous timing features.
 clean_ema <- function(ema) {
   ema %>%
     dplyr::mutate(
-      #3.3.1 Corrected self-report sleep timing (vectorized over rows)
-      sleeptime_corrected = purrr::map_vec(SLEEPTIME, correct_clock, context = "night"),
-      hrs_to_sleep_ema    = hours_from_anchor(sleeptime_corrected),
-      #3.3.2 SI binary items: instrument codes 1/2 -> 0/1
-      WISHTOBEDEAD           = WISHTOBEDEAD - 1,
+      
+      #3.3.1 Parse self-report sleep onset time (explicit AM/PM clock)
+      sleeptime_parsed = parse_clock(SLEEPTIME),
+      hrs_to_sleep_ema = hours_from_anchor(sleeptime_parsed),
+      
+      #3.2.2 SI binary items: instrument codes 1/2 -> 0/1
+      WISHTOBEDEAD = WISHTOBEDEAD - 1,
       ACTIVESUICIDALTHOUGHTS = ACTIVESUICIDALTHOUGHTS - 1,
-      SUICIDEATTEMPT         = SUICIDEATTEMPT - 1,
-      SELFHARM               = SELFHARM - 1,
-      #3.3.3 SI composites
+      SUICIDEATTEMPT = SUICIDEATTEMPT - 1,
+      SELFHARM = SELFHARM - 1,
+      
+      #3.2.3 SI composites
       si_severity = WISHTOBEDEAD + ACTIVESUICIDALTHOUGHTS + SUICIDEATTEMPT,
-      si_any      = pmax(WISHTOBEDEAD, ACTIVESUICIDALTHOUGHTS, SUICIDEATTEMPT),
-      #3.3.4 Sleep self-report composite (items SLEEP2-4 are 1-anchored)
-      sleep_disturbance = SLEEP2 + SLEEP3 + SLEEP4 - 3
-    ) %>%
-    dplyr::rename(
-      depression    = Depression,
-      anxiety       = Anxiety,
-      sleep_quality = Sleep1,
-      si_bother     = SICont,
-      controllability = Control_Slider
-    )
+      si_any = pmax(WISHTOBEDEAD, ACTIVESUICIDALTHOUGHTS, SUICIDEATTEMPT),
+      
+      #3.2.4 Sleep self-report composite (items SLEEP2-4 are 1-anchored)
+      sleep_disturbance = SLEEP2 + SLEEP3 + SLEEP4 - 3) %>%
+        dplyr::rename(
+          depression = Depression,
+          anxiety = Anxiety,
+          sleep_quality = Sleep1,
+          si_bother = SICont,
+          controllability = Control_Slider)
 }
 
 
 ## 4. Assemble the analytic person-day table ##
 
-#4.1 Orchestrate: load -> clean -> join -> engineer features -> filter -> save.
+#4.1 Orchestrate: load -> crosswalk -> clean -> dedupe -> join -> engineer -> save.
 build_dataset <- function(cfg) {
-
+  
   #4.1.1 Load sources
-  ema    <- load_ema_long(file.path(RAW, cfg$sources$ema_long_csv))
+  ema <- load_ema_long(file.path(RAW, cfg$sources$ema_long_csv))
   gonogo <- load_ema_gonogo(file.path(RAW, cfg$sources$ema_gonogo_dir),
                             cfg$sources$ema_gonogo_glob)
-  actig  <- load_actigraphy(actig_dir, cfg$actigraphy$header_skip)
-
-  #4.1.2 Clean EMA survey, then merge daily go/no-go on the survey instance keys
-  ema_clean <- clean_ema(ema)
+  actig <- load_actigraphy(actig_dir, cfg$actigraphy$header_skip)
+  
+  #4.1.2 Participant ID crosswalk. The go/no-go table is the only source carrying
+  #       BOTH the platform id (subjectrspid == EMA `id`) and the canonical study
+  #       label (subject, e.g. "SleepBD09"); we use it to map id -> subject. Must 
+  #       be 1:1 at the participant level
+  id_xwalk <- gonogo %>%
+    dplyr::distinct(subjectrspid, subject) %>%
+    dplyr::filter(!is.na(subjectrspid), !is.na(subject))
+  
+  if (any(duplicated(id_xwalk$subjectrspid)))
+    stop("ID crosswalk is not 1:1: a subjectrspid maps to multiple subject labels.")
+  
+  #4.1.3 Clean EMA -> PERSON-DAY BACKBONE, then attach canonical `subject` up front
+  #       (EMA `id` == go/no-go `subjectrspid`) so every downstream key uses it
+  ema_clean <- clean_ema(ema) %>%
+    dplyr::left_join(id_xwalk, by = c("id" = "subjectrspid"))
+  
+  n_unmapped <- sum(is.na(ema_clean$subject))
+  
+  if (n_unmapped > 0L)
+    message("Note: ", n_unmapped, " EMA row(s) had no id->subject match ",
+            "(EMA ids absent from the go/no-go files); they carry NA subject.")
+  
+  #4.1.3.1 Enforce one survey row per (subject, day); keep the most-complete row
+  dup_ema <- ema_clean %>% dplyr::filter(!is.na(subject)) %>%
+    dplyr::count(subject, day) %>% dplyr::filter(n > 1L)
+  
+  if (nrow(dup_ema) > 0L) {
+    message("Collapsing ", sum(dup_ema$n - 1L),
+            " duplicate EMA person-day row(s) to the most-complete record.")
+    
+    ema_clean <- ema_clean %>%
+      dplyr::mutate(.n_obs = rowSums(!is.na(dplyr::across(dplyr::everything())))) %>%
+      dplyr::group_by(subject, day) %>%
+      dplyr::slice_max(.n_obs, n = 1L, with_ties = FALSE) %>%
+      dplyr::ungroup() %>%
+      dplyr::select(-.n_obs)
+  }
+  
+  #4.1.4 Attach daily go/no-go METRICS on the per-instance key (instance + id).
+  #      Select keys + metrics only so we never re-merge `subject`; many-to-one
+  #      guards against fan-out
+  gonogo_metrics <- gonogo %>%
+    dplyr::select(sessionid, subjectrspid, meanrt, rt_cv, commission, errorrate) %>%
+    dplyr::distinct(sessionid, subjectrspid, .keep_all = TRUE)
+  
   ema_task <- ema_clean %>%
-    dplyr::full_join(gonogo, by = c("instance_id" = "sessionid",
-                                    "rsp_id" = "subjectrspid"))
-
-  #4.1.3 Quality filters on go/no-go reaction-time metrics
-  ema_task <- ema_task %>%
+    dplyr::left_join(gonogo_metrics,
+                     by = c("instance_id" = "sessionid", "id" = "subjectrspid"),
+                     relationship = "many-to-one") %>%
     dplyr::mutate(
       meanrt = dplyr::if_else(meanrt > 1.5, NA_real_, meanrt),
-      rt_cv  = dplyr::if_else(rt_cv  > 2.0, NA_real_, rt_cv)
-    )
-
-  #4.1.4 Align actigraphy to EMA day, then join on (subject, day)
+      rt_cv  = dplyr::if_else(rt_cv  > 2.0, NA_real_, rt_cv))
+  
+  #4.1.5 Actigraphy: align to EMA day, keep ONE primary (longest-TST) sleep period
+  #       per (subject, day), drop unmatched periods, LEFT-join (many-to-one)
   actig_clean <- clean_actigraphy(actig)
-  actig_dayed <- align_actigraphy_to_day(actig_clean, ema_task)
+  
+  actig_only <- setdiff(unique(actig_clean$subject), unique(ema_clean$subject))
+  
+  if (length(actig_only) > 0L)
+    message("Note: ", length(actig_only), " actigraphy label(s) have no EMA match ",
+            "(format mismatch would drop their sleep): ",
+            paste(utils::head(actig_only, 5), collapse = ", "))
+  
+  actig_dayed <- align_actigraphy_to_day(actig_clean, ema_task) %>%
+    dplyr::filter(!is.na(day)) %>%
+    dplyr::group_by(subject, day) %>%
+    dplyr::slice_max(sleep_totalmin, n = 1L, with_ties = FALSE) %>%
+    dplyr::ungroup()
+  
   daily <- ema_task %>%
-    dplyr::full_join(actig_dayed, by = c("subject", "day"))
-
-  #4.1.5 Derived sleep-timing + empirical-logit cognition feature
+    dplyr::left_join(actig_dayed, by = c("subject", "day"),
+                     relationship = "many-to-one")
+  
+  #4.1.6 Derived sleep-timing + empirical-logit cognition feature
   daily <- daily %>%
     dplyr::mutate(
-      hrs_to_sleep      = hours_from_anchor(sleep_onsettime),
-      commission_elogit = empirical_logit(commission)
-    )
-
-  #4.1.6 Within-person variability scaffolding (rolling window from config)
-  w <- cfg$dynamics$ews_window
+      hrs_to_sleep = hours_from_anchor(sleep_onsettime),
+      commission_elogit = empirical_logit(commission, n_trials = cfg$cognition$n_nogo_trials))
+  
+  #4.1.7 Within-person variability scaffolding at rolling window from config
+  w  <- cfg$dynamics$ews_window
   cv <- function(v) stats::sd(v, na.rm = TRUE) / mean(v, na.rm = TRUE)
   daily <- daily %>%
     dplyr::group_by(subject) %>%
     dplyr::arrange(day, .by_group = TRUE) %>%
     dplyr::mutate(
-      sleepeff_movingcv  = zoo::rollapply(sleep_eff,  w, cv, fill = NA, align = "right"),
-      sleeptime_movingcv = zoo::rollapply(hrs_to_sleep, w, cv, fill = NA, align = "right")
-    ) %>%
+      sleepeff_movingcv = zoo::rollapply(sleep_eff,    w, cv, fill = NA, align = "right"),
+      sleeptime_movingcv = zoo::rollapply(hrs_to_sleep, w, cv, fill = NA, align = "right")) %>%
     dplyr::ungroup()
-
-  #4.1.7 Sample filters: protocol exclusions + drop onboarding day 1
+  
+  #4.1.8 Sample filters: protocol exclusions + drop onboarding day 1
   daily <- daily %>% dplyr::filter(!subject %in% cfg$sample$exclude_ids)
   if (isTRUE(cfg$sample$exclude_day_1)) daily <- daily %>% dplyr::filter(day != 1L)
-
+  
+  #4.1.9 Backbone integrity: exactly one row per (subject, day)
+  n_rows <- nrow(daily); n_keys <- dplyr::n_distinct(daily[c("subject", "day")])
+  
+  message(glue::glue(
+    "Backbone integrity: {n_rows} rows / {n_keys} unique (subject, day) -> ",
+    "{ifelse(n_rows == n_keys, 'OK (one row per person-day)', 'STILL DUPLICATED')}"))
+  
   daily
 }
 
@@ -248,17 +328,18 @@ build_dataset <- function(cfg) {
 ## 5. Run + persist ##
 
 #5.1 Build and write with a dynamic, informative filename
-if (sys.nframe() == 0L) {        # only when run as a script, not when sourced
+if (sys.nframe() == 0L) {
   daily <- build_dataset(cfg)
 
   out_csv <- file.path(cfg$paths$data_processed,
                        out_name("ema_daily", "csv", algo = cfg$actigraphy$algorithm))
+  
   dir.create(cfg$paths$data_processed, recursive = TRUE, showWarnings = FALSE)
+  
   write_if_any(daily, out_csv)
 
-  #5.1.1 Quick size + missingness sanity check (printed, not committed)
+  #5.1.1 Quick size + missingness sanity check
   message(glue::glue(
     "Built analytic table: {nrow(daily)} person-days across ",
-    "{dplyr::n_distinct(daily$subject)} subjects."
-  ))
+    "{dplyr::n_distinct(daily$subject)} subjects."))
 }

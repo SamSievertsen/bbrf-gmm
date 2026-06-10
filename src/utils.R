@@ -20,7 +20,7 @@ load_config <- function(path = here::here("config.yml"), profile = "default") {
   cfg <- yaml::read_yaml(path)[[profile]]
 
   #1.1.1 Optional local overrides (untracked)
-  local_path <- here::here("config.local.yml")
+  local_path <- here::here("config.yml")
   if (file.exists(local_path)) {
     local_cfg <- yaml::read_yaml(local_path)[[profile]]
     cfg <- utils::modifyList(cfg, local_cfg)
@@ -88,7 +88,6 @@ write_if_any <- function(df, path) {
 }
 
 #3.2 Build a dynamic, informative output filename: <stem>_<algo>_<date>.<ext>.
-#    Replaces the analysts' hardcoded, date-stamped-by-hand convention.
 out_name <- function(stem, ext = "csv", algo = NULL, date = Sys.Date()) {
   parts <- c(stem, algo, format(as.Date(date), "%Y%m%d"))
   parts <- parts[!is.null(parts) & nzchar(parts)]
@@ -96,7 +95,7 @@ out_name <- function(stem, ext = "csv", algo = NULL, date = Sys.Date()) {
 }
 
 
-## 4. Visualization theme (Storytelling-with-Data aligned) ##
+## 4. Visualization theme ##
 
 #4.1 Decluttered ggplot theme: no chartjunk, muted axes, readable type,
 #    left-aligned title. Mirrors the seaborn/SWD aesthetic from prior work,
@@ -105,21 +104,76 @@ out_name <- function(stem, ext = "csv", algo = NULL, date = Sys.Date()) {
 theme_swd <- function(base_size = 12, base_family = "") {
   ggplot2::theme_minimal(base_size = base_size, base_family = base_family) +
     ggplot2::theme(
-      plot.title       = ggplot2::element_text(face = "bold", hjust = 0, size = base_size + 2),
-      plot.subtitle    = ggplot2::element_text(hjust = 0, colour = "grey30"),
-      axis.title       = ggplot2::element_text(colour = "grey20"),
-      axis.text        = ggplot2::element_text(colour = "grey35"),
+      plot.title = ggplot2::element_text(face = "bold", hjust = 0, size = base_size + 2),
+      plot.subtitle = ggplot2::element_text(hjust = 0, colour = "grey30"),
+      axis.title = ggplot2::element_text(colour = "grey20"),
+      axis.text = ggplot2::element_text(colour = "grey35"),
       panel.grid.minor = ggplot2::element_blank(),
       panel.grid.major.x = ggplot2::element_blank(),
       panel.grid.major.y = ggplot2::element_line(colour = "grey88", linewidth = 0.4),
-      legend.position  = "bottom",
-      legend.title     = ggplot2::element_text(colour = "grey20"),
-      plot.title.position = "plot"
-    )
+      legend.position = "bottom",
+      legend.title = ggplot2::element_text(colour = "grey20"),
+      plot.title.position = "plot")
 }
 
 #4.2 Restrained categorical palette for latent states (color used purposefully)
 state_palette <- function(n) {
   base <- c("#2C7FB8", "#D95F02", "#1B9E77", "#7570B3", "#E7298A", "#666666")
   if (n <= length(base)) base[seq_len(n)] else grDevices::hcl.colors(n, "Dark 3")
+}
+
+#4.3 theme_hw(): primary project theme with bold title, viridis-friendly, bottom legend
+theme_hw <- function() {
+  ggplot2::theme_minimal(base_size = 13) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(face = "bold", size = 14),
+      plot.subtitle = ggplot2::element_text(size = 11, colour = "grey40"),
+      axis.title = ggplot2::element_text(size = 11),
+      axis.text = ggplot2::element_text(size = 10),
+      panel.grid.minor = ggplot2::element_blank(),
+      panel.grid.major = ggplot2::element_line(colour = "grey90"),
+      legend.position = "bottom",
+      strip.text = ggplot2::element_text(face = "bold"))
+}
+
+## 5. Presentation & model-interpretation helpers ##
+
+#5.1 nice_tbl(): clean kable + kableExtra styling
+nice_tbl <- function(x, caption = NULL, digits = 3, stripe = FALSE) {
+  opts <- c("hover", "condensed", "responsive")
+  if (stripe) opts <- c("striped", opts)
+  knitr::kable(x, caption = caption, digits = digits) |>
+    kableExtra::kable_styling(bootstrap_options = opts, full_width = FALSE)
+}
+
+#5.2 gmm_state_profile(): un-standardize component means back to NATIVE units so
+#    each state reads interpretably (slider points, %, minutes, logits). Requires
+#    X built by zscore_matrix() (carries center/scale attributes
+gmm_state_profile <- function(fit, X) {
+  ctr <- attr(X, "center"); scl <- attr(X, "scale")
+  if (is.null(ctr) || is.null(scl))
+    stop("X lacks center/scale attributes; build it with zscore_matrix().")
+  native <- sweep(sweep(fit$mu, 2L, scl, "*"), 2L, ctr, "+")
+  colnames(native) <- colnames(X)
+  out <- tibble::as_tibble(round(native, 2))
+  out$state <- factor(seq_len(nrow(out)))
+  out$weight <- round(fit$weights, 3)
+  out$n_days <- as.integer(round(fit$weights * nrow(X)))
+  dplyr::relocate(out, state, weight, n_days)
+}
+
+#5.3 gmm_feature_discrimination(): how much each feature separates the states.
+#    between = weighted variance of component means; within = weighted mean of
+#    component variances (both standardized, so comparable). Ratio >> 1 drives
+#    separation; near 0 = ~constant across states (a demotion candidate)
+gmm_feature_discrimination <- function(fit, X) {
+  w <- fit$weights; K <- fit$K
+  grand   <- colSums(w * fit$mu)
+  between <- colSums(w * sweep(fit$mu, 2L, grand, "-")^2)
+  within  <- Reduce(`+`, lapply(seq_len(K), function(k) w[k] * diag(fit$Sigma[[k]])))
+  tibble::tibble(feature = colnames(X),
+                 between = round(between, 3),
+                 within  = round(within, 3),
+                 discrimination = round(between / within, 3)) |>
+    dplyr::arrange(dplyr::desc(discrimination))
 }
