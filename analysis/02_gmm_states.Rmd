@@ -7,6 +7,9 @@ output:
     number_sections: false
 params:
   profile: "default"
+editor_options: 
+  markdown: 
+    wrap: 72
 ---
 
 ```{r global, include = FALSE}
@@ -16,6 +19,7 @@ knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, comment = "")
 ```{r environment, message = FALSE}
 
 ## Load packages, source code, and config ##
+
 suppressPackageStartupMessages({
   library(here);
   library(dplyr);
@@ -46,55 +50,71 @@ daily <- readr::read_csv(daily_path, show_col_types = FALSE)
 ## Analysis Overview
 
 Goal is to discover latent daily states from a small set of continuous
-psychophysiological features (i.e., mood, actigraphy derived sleep, go/no-go cognition) by
-fitting a Gaussian Mixture Model via EM, then characterize those states by their
-suicidal-ideation profiles and analyze how individuals move among them over time.
+psychophysiological features (i.e., mood, actigraphy derived sleep,
+go/no-go cognition) by fitting a Gaussian Mixture Model via EM, then
+characterize those states by their suicidal-ideation profiles and
+analyze how individuals move among them over time.
 
 **This will occur in three stages.**
 
-1. *Univariate EM (EDA + code stepping-stone).* Fit a 1-D GMM to each feature to
-   inspect multimodality before committing to the joint model
-2. *Multivariate GMM (the model).* Fit the joint mixture, select K by BIC with
-   multi-restart stability, and guard against person-identity artifacts
-3. *States + dynamics.* Overlay SI/SB onto states; decode per-person state
-   sequences; relate early-warning indicators (variance, lag-1 autocorrelation)
-   to transitions into high-SI states
+1.  *Univariate EM (EDA + code stepping-stone).* Fit a 1-D GMM to each
+    feature to inspect multimodality before committing to the joint
+    model. We also run a pre-registered check on the go/no-go commission
+    feature and document its eventual exclusion from the mixture
+2.  *Multivariate GMM (the model).* Fit the joint mixture; select K by
+    comparing BIC, AIC, and ICL (with classification entropy and the
+    smallest mixing weight as degeneracy diagnostics), a Kneedle knee, a
+    marginal density-fit comparison, and the person x state artifact
+    check (never a single minimum)
+3.  *States + dynamics.* Overlay SI/SB onto states; decode per-person
+    state sequences; relate early-warning indicators (variance, lag-1
+    autocorrelation) to transitions into high-SI states
 
-```{r prepare-features, echo = FALSE, warning = FALSE}
+```{r prepare_features, echo = FALSE, warning = FALSE}
 
 ## 1. Build the standardized feature matrix (complete cases) ##
 
-#1.1 Pull the configured GMM input features
+#1.1 Configured features. The FULL set (`feat`) drives Stage-1 EDA and the
+#    documented commission check; the MODELING set (`feat_model`) drops any
+#    features flagged for documented exclusion (e.g., commission_elogit) so they
+#    never enter the mixture, while their evidence is retained.
 feat <- cfg$features
+feat_excl <- if (!is.null(cfg$gmm$exclude_from_mixture)) unlist(cfg$gmm$exclude_from_mixture) else character(0)
+feat_model <- setdiff(feat, feat_excl)
 stopifnot(all(feat %in% names(daily)))
 
-#1.2 Complete-case person-days across the feature set (report the retained N)
+#1.2 Complete-case on the MODELING features (so an excluded feature's missingness
+#    can't shrink N), while carrying the excluded feature(s) + overlays for
+#    documentation and Stage-3 characterization.
 model_df <- daily |>
   dplyr::select(subject, day, dplyr::all_of(feat),
                 dplyr::any_of(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare))) |>
-  tidyr::drop_na(dplyr::all_of(feat))
+  tidyr::drop_na(dplyr::all_of(feat_model))
 
 message(glue::glue(
   "Modeling on {nrow(model_df)} complete person-days ",
   "across {dplyr::n_distinct(model_df$subject)} subjects ",
-  "(of {nrow(daily)} total person-days)."))
+  "(of {nrow(daily)} total person-days). Modeling features: ",
+  "{paste(feat_model, collapse = ', ')}."))
 
-#1.3 Standardize features (z-score); keep person id aligned for the artifact check
-X <- zscore_matrix(model_df[, feat])
+#1.3 Standardize the MODELING features; keep person id aligned for the artifact check
+X <- zscore_matrix(model_df[, feat_model])
 person_id <- model_df$subject
 
 ```
 
 ## 1. Univariate EM (per-feature multimodality)
 
-```{r feat dists, echo = FALSE, warning = FALSE}
+```{r stage1_feat_dists, echo = FALSE, warning = FALSE}
 
-## Stage 1a: feature distributions (shape QC) ##
+## Stage 1a: feature distributions (shape QC) shown for the FULL set ##
 
-#1a.1 Long-format the GMM input features in native units
+#1a.1 Long-format the full feature set in native units, incl. commission so its
+#     floor-heavy distribution is documented before the exclusion section
 feat_long <- model_df |>
   dplyr::select(dplyr::all_of(feat)) |>
-  tidyr::pivot_longer(dplyr::everything(), names_to = "feature", values_to = "value")
+  tidyr::pivot_longer(dplyr::everything(), names_to = "feature", values_to = "value") |>
+  tidyr::drop_na(value)
 
 #1a.2 Faceted histograms: read for skew, spikes/floors, and modality
 ggplot(feat_long, aes(x = value)) +
@@ -116,8 +136,7 @@ feat_long |>
 
 ```
 
-
-```{r univariate-em}
+```{r stage1_univariate_em}
 
 ## Fit a 2-component 1-D GMM to each feature as exploratory structure check ##
 
@@ -144,11 +163,62 @@ nice_tbl(uni_summary, caption = "Univariate 2-component summaries", digits = 3)
 
 ```
 
+## Commission: documented exclusion check
+
+Go/no-go commission-error rate is a theoretically central index of
+inhibitory control, and we retained it as a candidate state feature. But
+\~45% of person-days have zero commission errors (\<=1 error on \~50
+trials; see the floor share above), so the empirical-logit rate carries
+a point mass that a Gaussian component can only absorb by collapsing its
+variance. The check below fits the mixture with commission included and
+shows the consequence, i.e., commission dominates feature discrimination
+only by spawning near-zero-variance components anchored at the
+error-rate floor. In other words, it sorts days into "any errors vs
+none" rather than indexing graded control. On that pre-registered basis
+we exclude it from the mixture and retain it as a descriptive overlay on
+the mood/sleep states. The evidence is kept here for the writeup.
+
+```{r commission_documented_exclusion}
+
+## Why commission is an overlay, not a mixture input (evidence retained) ##
+
+if ("commission_elogit" %in% feat) {
+
+  #C.1 Fit on commission-complete days, on the FULL feature set, at a documented K
+  doc_rows <- which(stats::complete.cases(model_df[, feat]))
+  X_doc <- zscore_matrix(model_df[doc_rows, feat])
+  k_doc <- cfg$gmm$commission_doc_k
+
+  fit_doc <- gmm_em_fit(X_doc, K = k_doc, n_restarts = cfg$gmm$n_restarts,
+                        max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol,
+                        ridge = cfg$gmm$ridge, seed = cfg$gmm$seed)
+
+  #C.2 Commission dominates discrimination (via near-zero within-component variance)
+  nice_tbl(gmm_feature_discrimination(fit_doc, X_doc),
+           caption = glue::glue("Commission INCLUDED (K = {k_doc}): per-feature discrimination ",
+                               "(commission's ratio is inflated by a near-zero-variance spike)"))
+
+  #C.3 The smoking gun: states whose commission var_z sits at the ridge are the
+  #    degenerate zero-error spike(s)
+  ci <- which(colnames(X_doc) == "commission_elogit")
+  nice_tbl(tibble::tibble(
+    state = factor(seq_len(fit_doc$K)),
+    mean_z = round(fit_doc$mu[, ci], 2),
+    var_z  = round(vapply(fit_doc$Sigma, function(S) S[ci, ci], numeric(1)), 4),
+    weight = round(fit_doc$weights, 3)),
+    caption = "commission_elogit by state (var_z near the GMM ridge => degenerate spike)")
+
+} else {
+  message("commission_elogit not in the configured feature set; skipping documented check.")
+}
+
+```
+
 ## 2. Multivariate GMM + model selection
 
 ```{r gmm_select_k}
 
-## Fit across K and select by BIC (with multi-restart stability) ##
+## Fit across K; compare BIC, AIC, ICL (+ entropy, smallest mixing weight) ##
 
 sel <- gmm_select_k(
   X,
@@ -159,34 +229,114 @@ sel <- gmm_select_k(
   ridge = cfg$gmm$ridge,
   seed = cfg$gmm$seed)
 
-nice_tbl(sel$bic_table, caption = "Model selection across K (BIC)", digits = 1)
+nice_tbl(sel$bic_table,
+         caption = "Model selection across K (BIC, AIC, ICL, entropy, min mixing weight)",
+         digits = 1)
 
-message("BIC-selected K = ", sel$best_k)
+#2.1 Objective knees on the BIC and ICL curves
+k_knee_bic <- kneedle(sel$bic_table$K, sel$bic_table$bic)
+k_knee_icl <- kneedle(sel$bic_table$K, sel$bic_table$icl)
 
-best <- sel$best_fit
+message(glue::glue("BIC min K={sel$best_k} | ICL min K={sel$best_k_icl} | ",
+                   "Kneedle(BIC) K={k_knee_bic} | Kneedle(ICL) K={k_knee_icl}"))
 
-#2.1 BIC curve: lower is better; read the elbow, not just the minimum
-ggplot(sel$bic_table, aes(x = K, y = bic)) +
-  geom_line(colour = "grey70", linewidth = 0.6) +
-  geom_point(size = 2.5, colour = "grey45") +
-  geom_point(data = subset(sel$bic_table, K == sel$best_k),
-             size = 4, colour = "#21908C") +
+#2.2 BIC vs ICL: ICL adds an overlap/entropy penalty, so it resists the
+#    over-splitting BIC shows when the mixture tiles density rather than finding
+#    distinct subgroups
+crit_long <- sel$bic_table |>
+  dplyr::select(K, BIC = bic, ICL = icl) |>
+  tidyr::pivot_longer(c(BIC, ICL), names_to = "criterion", values_to = "value")
+
+ggplot(crit_long, aes(K, value, colour = criterion)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.4) +
+  geom_vline(xintercept = sel$best_k_icl, linetype = 2, colour = "grey50") +
+  scale_colour_viridis_d(end = 0.6) +
   scale_x_continuous(breaks = sel$bic_table$K) +
-  labs(title = "Model selection by BIC",
-       subtitle = "Lower is better \u2014 read the elbow, not just the minimum",
-       x = "Number of states (K)", y = "BIC") +
+  labs(title = "Model selection: BIC vs ICL",
+       subtitle = glue::glue("dashed = ICL-min (K={sel$best_k_icl}); ",
+                             "Kneedle(ICL) K={k_knee_icl}; lower is better"),
+       x = "Number of states (K)", y = "Criterion") +
   theme_hw()
+
+#2.3 Candidate K set for the density comparison (DYNAMIC; config-overridable).
+#    Defaults to the ICL minimum, the ICL knee, and K=2 if not specified given
+#    its visual relevance derived from the density plots
+candidate_k <- if (!is.null(cfg$gmm$candidate_k)) {
+  sort(unique(unlist(cfg$gmm$candidate_k)))
+} else {
+  sort(unique(c(2L, sel$best_k_icl, k_knee_icl)))
+}
+
+```
+
+```{r gmm_density_compare, fig.height = 7}
+
+## 2.4 Density-fit comparison across candidate K (the lecture's mixture density) ##
+
+#2.4.1 1-D marginal mixture density per feature, overlaid on the data histogram
+dens_1d <- purrr::map_dfr(candidate_k, function(k) {
+  fit_k <- sel$fits[[as.character(k)]]
+  purrr::map_dfr(colnames(X), function(f) gmm_marginal_density(fit_k, X, f)) |>
+    dplyr::mutate(K = factor(k))
+})
+
+model_long <- model_df |>
+  dplyr::select(dplyr::all_of(colnames(X))) |>
+  tidyr::pivot_longer(dplyr::everything(), names_to = "feature", values_to = "value")
+
+ggplot() +
+  geom_histogram(data = model_long, aes(value, y = ggplot2::after_stat(density)),
+                 bins = 30, fill = "grey88", colour = "white", linewidth = 0.2) +
+  geom_line(data = dens_1d, aes(value, density, colour = K), linewidth = 0.85) +
+  facet_wrap(~ feature, scales = "free", ncol = 2) +
+  scale_colour_viridis_d(end = 0.9) +
+  labs(title = "Marginal mixture-density fit by K",
+       subtitle = "Per-feature histogram with each candidate K's fitted marginal density",
+       x = NULL, y = "Density") +
+  theme_hw()
+
+#2.4.2 Joint density on the mood axis (depression x anxiety) per candidate K
+if (all(c("depression", "anxiety") %in% colnames(X))) {
+  biv <- purrr::map_dfr(candidate_k, function(k) {
+    gmm_bivariate_grid(sel$fits[[as.character(k)]], X, "depression", "anxiety") |>
+      dplyr::mutate(K = factor(k))
+  })
+
+  ggplot() +
+    geom_point(data = model_df, aes(depression, anxiety),
+               alpha = 0.18, size = 0.6, colour = "grey45") +
+    geom_contour(data = biv, aes(x, y, z = density, colour = ggplot2::after_stat(level))) +
+    facet_wrap(~ K) +
+    scale_colour_viridis_c() +
+    labs(title = "Joint mixture density on the mood axis by K",
+         subtitle = "Contours = fitted depression x anxiety density; points = person-days",
+         x = "Depression", y = "Anxiety", colour = "Density") +
+    theme_hw()
+}
+
+```
+
+```{r gmm_choose_k}
+
+## 2.5 Lock K from all lenses (config override, else the ICL minimum) ##
+chosen_k <- if (!is.null(cfg$gmm$chosen_k)) cfg$gmm$chosen_k else sel$best_k_icl
+best <- sel$fits[[as.character(chosen_k)]]
+message(glue::glue(
+  "Carrying K = {chosen_k} ",
+  "({ifelse(is.null(cfg$gmm$chosen_k), 'ICL default', 'config override')}). ",
+  "Set cfg$gmm$chosen_k after reviewing the criteria + density plots."))
 
 ```
 
 ```{r gmm_state_profiles}
 
-## 2.2 What ARE the states? Native-unit profiles + standardized fingerprints ##
+## 2.6 What ARE the states? Native-unit profiles + standardized fingerprints ##
 
 nice_tbl(gmm_state_profile(best, X), digits = 2,
          caption = "Latent state profiles (native units) and state size")
 
-#2.2.1 Standardized fingerprint (z-units; 0 = sample average), lollipop per state
+#2.6.1 Standardized fingerprint (z-units; 0 = sample average), lollipop per state
 fing <- best$mu
 
 colnames(fing) <- colnames(X)
@@ -195,7 +345,7 @@ fing <- tibble::as_tibble(fing)
 
 fing$state <- factor(seq_len(best$K))
 
-fing_long  <- tidyr::pivot_longer(fing, -state, names_to = "feature", values_to = "z_mean")
+fing_long <- tidyr::pivot_longer(fing, -state, names_to = "feature", values_to = "z_mean")
 
 ggplot(fing_long, aes(x = z_mean, y = feature, colour = state)) +
   geom_vline(xintercept = 0, linetype = 2, colour = "grey60") +
@@ -210,10 +360,9 @@ ggplot(fing_long, aes(x = z_mean, y = feature, colour = state)) +
 
 ```
 
-
 ```{r gmm_artifact_check}
 
-## 2.2 Person x state check: is any state just one person's days? ##
+## 2.7 Person x state check: is any state just one person's days? ##
 chk <- gmm_person_state_check(best, person_id)
 
 nice_tbl(data.frame(state = seq_along(chk$max_person_share),
@@ -223,52 +372,31 @@ nice_tbl(data.frame(state = seq_along(chk$max_person_share),
 
 ```
 
-```{r gmm_commission_check}
-
-## 2.4 Pre-registered commission check: does it separate states, or just spike? ##
-
-nice_tbl(gmm_feature_discrimination(best, X),
-         caption = "Per-feature discrimination (between/within); commission near the bottom => demotion candidate")
-
-#2.4.1 commission_elogit by state: a near-ridge var_z at the floor = degenerate spike
-if ("commission_elogit" %in% colnames(X)) {
-  ci <- which(colnames(X) == "commission_elogit")
-  nice_tbl(tibble::tibble(
-    state = factor(seq_len(best$K)),
-    mean_z = round(best$mu[, ci], 2),
-    var_z = round(vapply(best$Sigma, function(S) S[ci, ci], numeric(1)), 4),
-    weight = round(best$weights, 3)),
-    caption = "commission_elogit by state (var_z near the GMM ridge => degenerate spike)")
-}
-
-```
-
-
 ## 3. State characterization, SI overlay, and dynamics
 
-```{r state-overlay}
+```{r state_overlay}
 
-## 3.1 MAP-assign states and overlay SI prevalence per state ##
+## 3.1 MAP-assign states and overlay SI prevalence (+ commission) per state ##
 
 model_df$state <- factor(gmm_map_assign(best))
 
 overlay_vars <- intersect(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare),
                           names(model_df))
-state_profile <- model_df |>
+state_overlay <- model_df |>
   dplyr::group_by(state) |>
   dplyr::summarise(
     n_days = dplyr::n(),
     dplyr::across(dplyr::all_of(overlay_vars), ~ mean(.x, na.rm = TRUE)),
     .groups = "drop")
 
-knitr::kable(state_profile, digits = 3, caption = "SI/SB profile by latent state")
+nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) profile by latent state")
 
 ```
 
 ```{r dynamics, eval = FALSE}
 
 ## 3.2 Dynamics (Stage 3): per-person state sequences + early-warning signals ##
-# TODO (needs real data): for each subject, order states by `day`, then compute
+# TODO: for each subject, order states by `day`, then compute
 #   - dwell times and transition frequencies among states
 #   - rolling variance and lag-1 autocorrelation of each feature in the window
 #     preceding transitions INTO high-SI states (critical slowing down, Scheffer)
@@ -279,12 +407,24 @@ knitr::kable(state_profile, digits = 3, caption = "SI/SB profile by latent state
 
 ## Limitations
 
-- Person-days are not independent (within-person autocorrelation; clustering in
-  ~32 people); the GMM likelihood treats them as exchangeable. Mitigations: the
-  person x state artifact check above, and a planned person-mean-centered fit
-  (`person_center()`) isolating within-person state structure.
-- Actigraphy was processed with the Sadeh algorithm for most but not all
-  participants; the algorithm is a one-line config swap for a Cole-Kripke
-  sensitivity analysis.
-- If BIC prefers K = 1 or states reduce to person identity, that is itself a
-  reportable finding about the (lack of) shared multivariate state structure.
+-   Person-days are not independent (i.e., within-person
+    autocorrelation; clustering in \~30 people); the GMM likelihood
+    treats them as exchangeable, which inflates the effective N that BIC
+    assumes and biases it toward more components. Mitigations: ICL
+    (entropy-penalized) and the smallest-mixing-weight diagnostic
+    alongside BIC, the person x state artifact check, and a planned
+    person-mean-centered fit (`person_center()`) isolating within-person
+    state structure.
+-   Commission-error rate is excluded from the mixture (documented
+    above: \~45% zero-error days force degenerate components) and
+    reported as an overlay only.
+-   The daily EMA mood items are depression and anxiety only -- there is
+    no daily elevated-mood/manic item -- so states characterize the
+    depressive/dysregulated axis, with the manic pole captured only
+    indirectly (e.g., via sleep loss).
+-   Actigraphy was processed with the Sadeh algorithm for most but not
+    all participants; the algorithm is a one-line config swap for a
+    Cole-Kripke sensitivity analysis.
+-   If the criteria prefer K = 1 or states reduce to person identity,
+    that is itself a reportable finding about the (lack of) shared
+    multivariate state structure.
