@@ -39,7 +39,7 @@ source(here::here("src", "gmm_em.R"))
 cfg <- load_config(profile = params$profile)
 set.seed(cfg$gmm$seed)
 
-#0.3 Read the analytic person-day table built by R/01_build_dataset.R
+#0.3 Read the analytic person-day table built by src/01_build_dataset.R
 daily_path <- list.files(cfg$paths$data_processed, pattern = "^ema_daily",
                          full.names = TRUE) |> sort() |> dplyr::last()
 
@@ -284,9 +284,9 @@ message(glue::glue(
 
 ```{r gmm_density_compare, fig.height = 7, warning = FALSE}
 
-## 2.5 What each state's distribution looks like (at the chosen K) ##
+## 2.4 What each state's distribution looks like (at the chosen K) ##
 
-#2.5.1 PLOT A: per-feature component densities, one curve PER STATE, over the
+#2.4.1 PLOT A: per-feature component densities, one curve PER STATE, over the
 #      data histogram. Reads as: "for this feature, here is each state's density
 #      and where it sits." The summed (mixture) density is the dashed envelope
 comp_dens <- purrr::map_dfr(colnames(X),
@@ -314,7 +314,7 @@ ggplot() +
        x = NULL, y = "Density") +
   theme_hw()
 
-#2.5.2 PLOT B: the mood plane, coloured by hard state assignment, with each
+#2.4.2 PLOT B: the mood plane, coloured by hard state assignment, with each
 #      state's mean marked. Depression x anxiety = the dominant axis
 if (all(c("depression", "anxiety") %in% colnames(X))) {
   state_means <- gmm_state_profile(best, X)
@@ -332,7 +332,7 @@ if (all(c("depression", "anxiety") %in% colnames(X))) {
     theme_hw()
 }
 
-#2.5.3 PLOT C: standardized state x feature heatmap (compact fingerprint).
+#2.4.3 PLOT C: standardized state x feature heatmap (compact fingerprint).
 #      A single grid: rows = states, columns = features, fill = z-mean. Fast read
 #      of "what is high/low in each state" across ALL features at once
 fing_long <- best$mu |>
@@ -396,6 +396,141 @@ nice_tbl(data.frame(state = seq_along(chk$max_person_share),
 
 ```
 
+## 2.8 Sensitivity: within-person (person-mean-centered) refit
+
+The primary model is fit on raw (across-sample standardized) person-days, so a
+fair objection is that the states might be sorting *people* (chronically
+high-distress vs chronically euthymic individuals) rather than capturing
+*within-person day-to-day shifts* -- the latter being the dynamical-systems
+claim we actually want to make. The artifact check already shows no state is one
+person's days; this sensitivity goes further by asking whether the same state
+structure survives when **all** stable between-person differences are removed.
+
+Two reads. First, the per-feature **ICC(1)** quantifies how much of each
+feature's variance is between-person (trait) vs within-person (state); the lower
+the ICC, the more a feature reflects genuine day-to-day movement, and the more
+defensible the uncentered model is as the primary. Second, we refit the entire
+GMM on **person-mean-centered** features (each day expressed relative to that
+person's own average) and ask whether (a) model selection still prefers a
+comparable K, (b) the centered states show the same qualitative fingerprints,
+and (c) the day-level assignments agree with the primary solution (adjusted Rand
+index). We do not expect *identical* partitions -- centering deliberately moves a
+chronically-depressed person's average day off the high-distress state -- so the
+scientific question is whether a recognizable distress/euthymic structure
+*re-emerges from purely within-person variation*, which is exactly the claim the
+dynamical framing needs.
+
+```{r centered_icc, warning = FALSE}
+
+## 2.8.1 Per-feature ICC(1): between-person (trait) vs within-person (state) ##
+
+#2.8.1 One-way random-effects ICC via base-R aov (no new dependencies). High ICC
+#      => the feature mostly separates people (trait-like); low ICC => it mostly
+#      tracks within-person change (state-like, the signal we want). k0 is the
+#      unbalanced-design average group size.
+icc1 <- function(value, group) {
+  group <- factor(group)
+  ni <- table(group); g <- length(ni); N <- length(value)
+  ms  <- summary(stats::aov(value ~ group))[[1]][, "Mean Sq"]
+  msb <- ms[1]; msw <- ms[2]
+  k0  <- (N - sum(ni^2) / N) / (g - 1)
+  max((msb - msw) / (msb + (k0 - 1) * msw), 0)         # floor at 0
+}
+
+icc_tbl <- tibble::tibble(
+  feature = feat_model,
+  icc = vapply(feat_model, function(f) icc1(model_df[[f]], person_id), numeric(1))) |>
+  dplyr::mutate(pct_within = round(100 * (1 - icc), 1), icc = round(icc, 3)) |>
+  dplyr::arrange(icc)
+
+nice_tbl(icc_tbl,
+         caption = "Per-feature ICC(1): trait (between) vs state (within) variance share")
+
+```
+
+```{r centered_refit, fig.height = 4.5, warning = FALSE}
+
+## 2.8.2 Refit the GMM on person-mean-centered (within-person) features ##
+
+#2.8.2.1 Strip each person's own mean from every modeling feature, then
+#        re-standardize so the centered matrix carries the center/scale
+#        attributes the profilers need. Centered features encode "this day vs
+#        this person's average," removing all stable between-person differences.
+Xc <- zscore_matrix(person_center(model_df[, feat_model], person_id))
+
+#2.8.2.2 Run the SAME selection machinery on the centered data: does centering
+#        change the preferred K? (structure stability across the four lenses)
+sel_c <- gmm_select_k(
+  Xc, k_range = unlist(cfg$gmm$k_range), n_restarts = cfg$gmm$n_restarts,
+  max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol, ridge = cfg$gmm$ridge,
+  seed = cfg$gmm$seed)
+
+k_knee_bic_c <- kneedle(sel_c$bic_table$K, sel_c$bic_table$bic)
+k_knee_icl_c <- kneedle(sel_c$bic_table$K, sel_c$bic_table$icl)
+message(glue::glue(
+  "CENTERED selection: BIC min K={sel_c$best_k} | ICL min K={sel_c$best_k_icl} | ",
+  "Kneedle(BIC) K={k_knee_bic_c} | Kneedle(ICL) K={k_knee_icl_c}"))
+
+#2.8.2.3 Hold K at the PRIMARY chosen_k so the two partitions are directly
+#        comparable, then read the centered states' standardized fingerprints
+best_c <- sel_c$fits[[as.character(chosen_k)]]
+
+fing_c <- best_c$mu
+colnames(fing_c) <- colnames(Xc)
+fing_c <- tibble::as_tibble(fing_c)
+fing_c$state <- factor(seq_len(best_c$K))
+fing_c_long <- tidyr::pivot_longer(fing_c, -state, names_to = "feature", values_to = "z_mean")
+
+ggplot(fing_c_long, aes(feature, state, fill = z_mean)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%+.1f", z_mean)), size = 3) +
+  scale_fill_gradient2(low = "#3B528B", mid = "grey95", high = "#B8003E",
+                       midpoint = 0, name = "z-mean") +
+  labs(title = glue::glue("Within-person state fingerprints (centered; K = {best_c$K})"),
+       subtitle = "Person-mean-centered features; compare structure to the primary fit",
+       x = NULL, y = "State") +
+  theme_hw() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+```
+
+```{r centered_agreement, warning = FALSE}
+
+## 2.8.3 Do the two solutions agree? Confusion matrix + adjusted Rand index ##
+
+#2.8.3.1 Adjusted Rand index from scratch: partition agreement corrected for
+#        chance (0 = chance, 1 = identical). Invariant to label permutation, so
+#        it sidesteps GMM label-switching between the two fits.
+adjusted_rand <- function(a, b) {
+  tab <- table(a, b); cc <- function(x) choose(x, 2)
+  sij <- sum(cc(tab)); si <- sum(cc(rowSums(tab))); sj <- sum(cc(colSums(tab)))
+  expected <- si * sj / cc(sum(tab)); maxidx <- (si + sj) / 2
+  (sij - expected) / (maxidx - expected)
+}
+
+state_primary  <- gmm_map_assign(best)
+state_centered <- gmm_map_assign(best_c)
+ari <- adjusted_rand(state_primary, state_centered)
+
+#2.8.3.2 Confusion matrix: rows = primary (uncentered) state, cols = centered
+xtab <- as.data.frame.matrix(table(primary = state_primary, centered = state_centered))
+xtab <- tibble::rownames_to_column(xtab, "primary \\ centered")
+nice_tbl(xtab, digits = 0,
+         caption = glue::glue("Primary x centered assignment (adjusted Rand index = {round(ari, 3)})"))
+
+#2.8.3.3 Does the high-SI gradient survive centering? SI overlay by CENTERED state
+model_df$state_centered <- factor(state_centered)
+overlay_vars_c <- intersect(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare),
+                            names(model_df))
+nice_tbl(
+  model_df |>
+    dplyr::group_by(state_centered) |>
+    dplyr::summarise(n_days = dplyr::n(),
+                     dplyr::across(dplyr::all_of(overlay_vars_c), ~ mean(.x, na.rm = TRUE)),
+                     .groups = "drop"),
+  digits = 3, caption = "SI/SB profile by within-person (centered) state")
+
+```
+
 ## 3. State characterization, SI overlay, and dynamics
 
 ```{r state_overlay, warning = FALSE}
@@ -417,15 +552,148 @@ nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) pr
 
 ```
 
-```{r dynamics, eval = FALSE, warning = FALSE}
+```{r state_sequences, fig.height = 5, warning = FALSE}
 
-## 3.2 Dynamics (Stage 3): per-person state sequences + early-warning signals ##
-# TODO: for each subject, order states by `day`, then compute
-#   - dwell times and transition frequencies among states
-#   - rolling variance and lag-1 autocorrelation of each feature in the window
-#     preceding transitions INTO high-SI states (critical slowing down, Scheffer)
-# This is where the trajectory/dynamical-systems story is recovered from the
-# (otherwise day-exchangeable) Gaussian mixture.
+## 3.2 Stage 3a: per-person state sequences, dwell times, transitions ##
+
+#3.2.1 Decode each subject's MAP-state sequence ordered by study day. `day` is a
+#      1-30 study-day index, so consecutive days differ by exactly 1; a larger
+#      gap is a missed EMA day and must NOT be read as a transition.
+seq_df <- model_df |>
+  dplyr::mutate(state = as.integer(as.character(state))) |>
+  dplyr::arrange(subject, day) |>
+  dplyr::group_by(subject) |>
+  dplyr::mutate(prev_state = dplyr::lag(state),
+                prev_day   = dplyr::lag(day),
+                consecutive = !is.na(prev_day) & (day - prev_day == 1L)) |>
+  dplyr::ungroup()
+
+#3.2.2 Person x day state raster: each row a subject, each column a study day,
+#      coloured by MAP state (blank = missing day). The raw trajectory material.
+ggplot(seq_df, aes(day, factor(subject), fill = factor(state))) +
+  geom_tile(colour = "grey95", linewidth = 0.2) +
+  scale_fill_viridis_d(end = 0.9, name = "State") +
+  labs(title = "Per-person daily state sequences",
+       subtitle = "Each row = one subject across study days; gaps = missing EMA days",
+       x = "Study day", y = NULL) +
+  theme_hw() + theme(axis.text.y = element_text(size = 6))
+
+#3.2.3 Transition matrix over CONSECUTIVE-day pairs only (row = from, col = to).
+#      Row-normalized => empirical transition probabilities; the diagonal is
+#      state persistence (a slow, "sticky" state has high self-transition).
+trans <- seq_df |>
+  dplyr::filter(consecutive) |>
+  dplyr::count(from = prev_state, to = state) |>
+  tidyr::complete(from = seq_len(best$K), to = seq_len(best$K), fill = list(n = 0L)) |>
+  dplyr::group_by(from) |>
+  dplyr::mutate(prob = n / sum(n)) |>
+  dplyr::ungroup()
+
+ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = ifelse(n == 0, "", sprintf("%.2f", prob))), size = 3) +
+  scale_fill_viridis_c(end = 0.95, name = "P(to | from)") +
+  labs(title = "Day-to-day state transition probabilities",
+       subtitle = "Consecutive study-day pairs only; diagonal = persistence",
+       x = "To state (day t+1)", y = "From state (day t)") +
+  theme_hw()
+
+#3.2.4 Dwell times: lengths of maximal runs of the SAME state across consecutive
+#      days (a run is broken by a state change OR a day gap), i.e. how long the
+#      system typically sits in a state before moving.
+new_run <- !(seq_df$consecutive & seq_df$state == seq_df$prev_state)
+new_run[is.na(new_run)] <- TRUE
+seq_df$run <- cumsum(new_run)
+
+dwell <- seq_df |>
+  dplyr::group_by(subject, run, state) |>
+  dplyr::summarise(dwell = dplyr::n(), .groups = "drop") |>
+  dplyr::group_by(state) |>
+  dplyr::summarise(n_runs = dplyr::n(),
+                   mean_dwell = round(mean(dwell), 2),
+                   max_dwell  = max(dwell), .groups = "drop")
+
+nice_tbl(dwell, caption = "Dwell time per state (lengths of consecutive-day runs)")
+
+```
+
+```{r early_warning, fig.height = 5, warning = FALSE}
+
+## 3.3 Stage 3b (EXPLORATORY): critical-slowing-down before high-SI onset ##
+
+#3.3.1 Identify the empirically highest-SI state as the absorbing "target",
+#      keyed off the data (not a hard-coded label) so it survives GMM
+#      label-switching. Prefer the continuous bother score; fall back to the
+#      first configured primary overlay.
+si_metric <- if ("si_bother" %in% names(model_df)) "si_bother" else cfg$overlay$primary[1]
+target_state <- model_df |>
+  dplyr::mutate(state_i = as.integer(as.character(state))) |>
+  dplyr::group_by(state_i) |>
+  dplyr::summarise(m = mean(.data[[si_metric]], na.rm = TRUE), .groups = "drop") |>
+  dplyr::slice_max(m, n = 1, with_ties = FALSE) |>
+  dplyr::pull(state_i)
+
+ew_window <- 4L   # trailing consecutive-day window for variance / AC1 (short by necessity)
+
+#3.3.2 Slide a window of `ew_window` CONSECUTIVE days within each subject; for
+#      each feature compute the window's variance and lag-1 autocorrelation, and
+#      flag whether the day immediately AFTER the window is an entry INTO the
+#      target (high-SI) state. CSD predicts variance and AC1 rise pre-onset.
+ac1 <- function(x) {
+  if (length(x) < 3L || stats::sd(x) == 0) return(NA_real_)
+  stats::cor(x[-length(x)], x[-1])
+}
+
+ew_rows <- list(); r <- 0L
+for (sdf in split(seq_df, seq_df$subject)) {
+  sdf <- sdf[order(sdf$day), ]
+  if (nrow(sdf) < ew_window + 1L) next
+  for (i in seq_len(nrow(sdf) - ew_window)) {
+    win <- sdf[i:(i + ew_window - 1L), ]
+    nxt <- sdf[i + ew_window, ]
+    
+    #3.3.2.1 window must be fully consecutive, and `nxt` adjacent to its last day
+    if (any(diff(win$day) != 1L) || (nxt$day - win$day[ew_window]) != 1L) next
+    onset <- (win$state[ew_window] != target_state) && (nxt$state == target_state)
+    for (f in feat_model) {
+      r <- r + 1L
+      ew_rows[[r]] <- data.frame(feature = f,
+                                 variance = stats::var(win[[f]]),
+                                 ac1 = ac1(win[[f]]), onset = onset)
+    }
+  }
+}
+
+ew <- if (length(ew_rows)) do.call(rbind, ew_rows) else NULL
+
+#3.3.3 Compare indicator levels in pre-onset vs all other windows. With ~30
+#      short, gappy series this is UNDERPOWERED and strictly hypothesis-
+#      generating for the F31 -- read direction and spread, and check the n of
+#      pre-onset windows (the binding constraint), not significance.
+if (!is.null(ew) && nrow(ew) > 0L) {
+  ew_long <- ew |>
+    tidyr::pivot_longer(c(variance, ac1), names_to = "indicator", values_to = "value") |>
+    tidyr::drop_na(value)
+
+  nice_tbl(
+    ew_long |>
+      dplyr::group_by(feature, indicator, onset) |>
+      dplyr::summarise(n = dplyr::n(), mean = mean(value), .groups = "drop"),
+    digits = 3,
+    caption = glue::glue("Early-warning indicators: pre-onset vs other windows ",
+                         "(target = highest-SI state {target_state}; window = {ew_window} days)"))
+
+  ggplot(ew_long, aes(onset, value, fill = onset)) +
+    geom_boxplot(outlier.size = 0.6, width = 0.6) +
+    facet_grid(indicator ~ feature, scales = "free_y") +
+    scale_fill_viridis_d(end = 0.7, guide = "none") +
+    labs(title = glue::glue("Critical-slowing-down indicators before entering state {target_state}"),
+         subtitle = glue::glue("Exploratory; {ew_window}-day windows; TRUE = window precedes high-SI onset"),
+         x = "Window precedes high-SI onset", y = "Indicator value") +
+    theme_hw()
+} else {
+  message("No consecutive ", ew_window, "-day windows available; widen data or shorten ew_window.")
+}
 
 ```
 
@@ -436,19 +704,25 @@ nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) pr
     treats them as exchangeable, which inflates the effective N that BIC
     assumes and biases it toward more components. Mitigations: ICL
     (entropy-penalized) and the smallest-mixing-weight diagnostic
-    alongside BIC, the person x state artifact check, and a planned
-    person-mean-centered fit (`person_center()`) isolating within-person
-    state structure.
+    alongside BIC, the person x state artifact check, and the
+    person-mean-centered sensitivity refit (Section 2.8) isolating
+    within-person state structure
 -   Commission-error rate is excluded from the mixture (documented
     above: \~45% zero-error days force degenerate components) and
-    reported as an overlay only.
--   The daily EMA mood items are depression and anxiety only -- there is
-    no daily elevated-mood/manic item -- so states characterize the
+    reported as an overlay only
+-   The daily EMA mood items are depression and anxiety only; there is
+    no daily elevated-mood/manic item, so states characterize the
     depressive/dysregulated axis, with the manic pole captured only
-    indirectly (e.g., via sleep loss).
+    indirectly (e.g., via sleep loss)
 -   Actigraphy was processed with the Sadeh algorithm for most but not
     all participants; the algorithm is a one-line config swap for a
-    Cole-Kripke sensitivity analysis.
+    Cole-Kripke sensitivity analysis
 -   If the criteria prefer K = 1 or states reduce to person identity,
     that is itself a reportable finding about the (lack of) shared
-    multivariate state structure.
+    multivariate state structure
+-   The Stage-3b early-warning (critical-slowing-down) analysis is
+    exploratory and underpowered: short, gap-interrupted per-person
+    series yield few consecutive pre-onset windows, so it is reported as
+    hypothesis-generating preliminary evidence for the F31, not a
+    confirmatory test of rising variance / autocorrelation before
+    high-SI transitions
