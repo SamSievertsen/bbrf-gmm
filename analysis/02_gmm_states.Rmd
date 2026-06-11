@@ -39,7 +39,7 @@ source(here::here("src", "gmm_em.R"))
 cfg <- load_config(profile = params$profile)
 set.seed(cfg$gmm$seed)
 
-#0.3 Read the analytic person-day table built by src/01_build_dataset.R
+#0.3 Read the analytic person-day table built by R/01_build_dataset.R
 daily_path <- list.files(cfg$paths$data_processed, pattern = "^ema_daily",
                          full.names = TRUE) |> sort() |> dplyr::last()
 
@@ -578,7 +578,82 @@ ggplot(seq_df, aes(day, factor(subject), fill = factor(state))) +
        x = "Study day", y = NULL) +
   theme_hw() + theme(axis.text.y = element_text(size = 6))
 
-#3.2.3 Transition matrix over CONSECUTIVE-day pairs only (row = from, col = to).
+#3.2.2b Assignment confidence: mean max-responsibility per state. Values near 1
+#       mean confident hard assignments (well-separated states); values near 1/K
+#       mean fuzzy assignments, in which case rapid day-to-day "switching" is
+#       partly soft-assignment noise rather than true state change.
+conf_df <- tibble::tibble(state = factor(gmm_map_assign(best)),
+                          max_resp = gmm_max_resp(best)) |>
+  dplyr::group_by(state) |>
+  dplyr::summarise(n_days = dplyr::n(),
+                   mean_max_resp = round(mean(max_resp), 3),
+                   pct_confident = round(100 * mean(max_resp > 0.8), 1),
+                   .groups = "drop")
+
+nice_tbl(conf_df,
+         caption = glue::glue("MAP-assignment confidence per state (1/K = {round(1/best$K, 2)} ",
+                              "= chance; >0.8 = confident)"))
+
+```
+
+```{r state_si_overlay_raster, fig.height = 8, warning = FALSE}
+
+## 3.2b SI overlaid on the per-person state raster (one panel per SI metric) ##
+
+#3.2b.1 Choose the suicidality outcomes to overlay. Continuous metrics
+#       (si_bother, si_severity) drive point size/alpha; binary/count metrics
+#       (si_any, SELFHARM, SUICIDEATTEMPT, ACTIVESIWITHINTENT) are shown as a
+#       mark only on the days where the event is present. We split them so each
+#       is encoded honestly rather than forcing one scale onto both.
+si_continuous <- intersect(c("si_bother", "si_severity"), names(seq_df))
+si_binary     <- intersect(c("si_any", "ACTIVESIWITHINTENT", "SELFHARM", "SUICIDEATTEMPT"),
+                           names(seq_df))
+
+#3.2b.2 Long format: one row per (subject, day, metric). The tile still encodes
+#       STATE (the latent assignment); the overlay encodes the SI OUTCOME, so the
+#       plot answers "where do high-SI days fall across the state sequences?"
+si_long <- seq_df |>
+  dplyr::select(subject, day, state, dplyr::all_of(c(si_continuous, si_binary))) |>
+  tidyr::pivot_longer(dplyr::all_of(c(si_continuous, si_binary)),
+                      names_to = "si_metric", values_to = "si_value") |>
+  dplyr::mutate(
+    kind = ifelse(si_metric %in% si_continuous, "continuous", "binary"),
+    #3.2b.2.1 binary "present" = any non-zero/TRUE; continuous keeps its value
+    present = dplyr::case_when(
+      kind == "binary" ~ si_value > 0,
+      TRUE ~ !is.na(si_value)),
+    si_metric = factor(si_metric, levels = c(si_continuous, si_binary)))
+
+#3.2b.3 Base raster (state = fill) with the SI overlay drawn on top. For
+#       continuous metrics, a filled circle whose SIZE and OPACITY scale with the
+#       value; for binary metrics, a hollow diamond only on present-days. State
+#       fill is deliberately desaturated (alpha) so the black overlay reads.
+ggplot(si_long, aes(day, factor(subject))) +
+  geom_tile(aes(fill = factor(state)), colour = "grey95", linewidth = 0.15, alpha = 0.55) +
+  #3.2b.3.1 continuous SI: size + alpha encode magnitude
+  geom_point(data = dplyr::filter(si_long, kind == "continuous", present),
+             aes(size = si_value, alpha = si_value), shape = 16, colour = "grey10") +
+  #3.2b.3.2 binary/count SI: a single mark on present-days (size fixed)
+  geom_point(data = dplyr::filter(si_long, kind == "binary", present),
+             shape = 5, size = 1.5, stroke = 0.6, colour = "grey10") +
+  facet_wrap(~ si_metric, ncol = 1) +
+  scale_fill_viridis_d(end = 0.9, name = "State") +
+  scale_size_continuous(range = c(0.4, 3.2), name = "SI value") +
+  scale_alpha_continuous(range = c(0.25, 0.95), guide = "none") +
+  labs(title = "Suicidality overlaid on per-person daily state sequences",
+       subtitle = paste("Tile = MAP state; filled dot size/opacity = continuous SI;",
+                        "hollow diamond = binary/count SI event"),
+       x = "Study day", y = NULL) +
+  theme_hw() + theme(axis.text.y = element_text(size = 5),
+                     panel.spacing = grid::unit(0.6, "lines"))
+
+```
+
+```{r state_transition_network, fig.height = 6, warning = FALSE}
+
+## 3.2c State-transition structure: network + exact-probability heatmap ##
+
+#3.2.3 Transition structure over CONSECUTIVE-day pairs only (row = from, col = to).
 #      Row-normalized => empirical transition probabilities; the diagonal is
 #      state persistence (a slow, "sticky" state has high self-transition).
 trans <- seq_df |>
@@ -589,6 +664,91 @@ trans <- seq_df |>
   dplyr::mutate(prob = n / sum(n)) |>
   dplyr::ungroup()
 
+#3.2.3a Network layout: lay the K states on a circle. Node SIZE = how often the
+#       state is occupied; node FILL = that state's mean SI, so the high-risk
+#       state is visually obvious; directed curved EDGES = between-state
+#       transition probability (self-transitions annotated separately below).
+si_metric_net <- if ("si_bother" %in% names(model_df)) "si_bother" else cfg$overlay$primary[1]
+state_i_all <- as.integer(as.character(model_df$state))
+ang <- (seq_len(best$K) - 1) / best$K * 2 * pi + pi / 2     # start at top
+nodes <- tibble::tibble(
+  state = seq_len(best$K),
+  x = cos(ang), y = sin(ang),
+  occupancy = as.numeric(table(factor(state_i_all, levels = seq_len(best$K)))),
+  si = vapply(seq_len(best$K), function(s)
+    mean(model_df[[si_metric_net]][state_i_all == s], na.rm = TRUE), numeric(1)))
+
+#3.2.3b Off-diagonal edges only (between-state moves); drop near-zero edges so the
+#       graph isn't a hairball. A perpendicular midpoint offset bends each edge so
+#       opposing arrows (i->j vs j->i) don't overlap.
+edges <- trans |>
+  dplyr::filter(from != to, prob > 0.02) |>
+  dplyr::left_join(dplyr::rename(nodes, from = state, x0 = x, y0 = y), by = "from") |>
+  dplyr::left_join(dplyr::rename(nodes, to   = state, x1 = x, y1 = y), by = "to") |>
+  dplyr::mutate(
+    mx = (x0 + x1) / 2, my = (y0 + y1) / 2,
+    nx = -(y1 - y0), ny = (x1 - x0), len = sqrt(nx^2 + ny^2),
+    cx = mx + 0.12 * nx / len, cy = my + 0.12 * ny / len,   # bend control point
+    a0 = atan2(cy - y0, cx - x0), a1 = atan2(cy - y1, cx - x1),
+    x0t = x0 + 0.16 * cos(a0), y0t = y0 + 0.16 * sin(a0),   # trim off node centers
+    x1t = x1 + 0.16 * cos(a1), y1t = y1 + 0.16 * sin(a1))
+
+#3.2.3c Quadratic-Bezier polylines for each curved edge (base R; no igraph dep)
+bez <- function(p0, p1, p2, n = 30) {
+  t <- seq(0, 1, length.out = n)
+  (1 - t)^2 * p0 + 2 * (1 - t) * t * p1 + t^2 * p2
+}
+edge_paths <- if (nrow(edges) > 0) do.call(rbind, lapply(seq_len(nrow(edges)), function(i) {
+  e <- edges[i, ]
+  data.frame(id = i, prob = e$prob,
+             x = bez(e$x0t, e$cx, e$x1t), y = bez(e$y0t, e$cy, e$y1t))
+})) else NULL
+
+#3.2.3c.1 arrowhead = last segment of each edge path
+heads <- if (!is.null(edge_paths)) edge_paths |>
+  dplyr::group_by(id) |>
+  dplyr::slice_tail(n = 2) |>
+  dplyr::summarise(prob = dplyr::first(prob),
+                   x = dplyr::nth(x, 1), y = dplyr::nth(y, 1),
+                   xend = dplyr::nth(x, 2), yend = dplyr::nth(y, 2),
+                   .groups = "drop") else NULL
+
+#3.2.3d Self-persistence (diagonal) annotated just outside each node
+self_p <- trans |> dplyr::filter(from == to) |>
+  dplyr::select(state = from, p_self = prob) |>
+  dplyr::right_join(nodes, by = "state")
+
+net <- ggplot()
+if (!is.null(edge_paths)) {
+  net <- net +
+    geom_path(data = edge_paths,
+              aes(x, y, group = id, linewidth = prob, alpha = prob),
+              colour = "grey35", lineend = "round") +
+    geom_segment(data = heads,
+                 aes(x = x, y = y, xend = xend, yend = yend, alpha = prob),
+                 arrow = grid::arrow(length = grid::unit(0.16, "cm"), type = "closed"),
+                 colour = "grey35", linewidth = 0.4, show.legend = FALSE)
+}
+net +
+  geom_point(data = nodes, aes(x, y, size = occupancy, fill = si),
+             shape = 21, colour = "grey20", stroke = 0.8) +
+  geom_text(data = nodes, aes(x, y, label = state), fontface = "bold", size = 4) +
+  geom_text(data = self_p, aes(x * 1.24, y * 1.24,
+            label = sprintf("self %.0f%%", 100 * p_self)), size = 2.8, colour = "grey40") +
+  scale_linewidth_continuous(range = c(0.3, 2.6), name = "P(transition)") +
+  scale_alpha_continuous(range = c(0.25, 0.95), guide = "none") +
+  scale_size_continuous(range = c(6, 18), name = "Occupancy (days)") +
+  scale_fill_viridis_c(option = "magma", end = 0.9, name = glue::glue("Mean {si_metric_net}")) +
+  coord_equal(xlim = c(-1.5, 1.5), ylim = c(-1.5, 1.5)) +
+  labs(title = "State-transition network",
+       subtitle = "Node size = occupancy, fill = mean SI; arrow width = P(move | from); self-% = persistence") +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, colour = "grey40"),
+        legend.position = "right")
+
+#3.2.3e Companion heatmap: exact probabilities incl. the diagonal the network
+#       abstracts. Network = structure at a glance; heatmap = precise values.
 ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
   geom_tile(colour = "white", linewidth = 0.6) +
   geom_text(aes(label = ifelse(n == 0, "", sprintf("%.2f", prob))), size = 3) +
@@ -597,6 +757,12 @@ ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
        subtitle = "Consecutive study-day pairs only; diagonal = persistence",
        x = "To state (day t+1)", y = "From state (day t)") +
   theme_hw()
+
+```
+
+```{r state_dwell, warning = FALSE}
+
+## 3.2d Dwell times per state ##
 
 #3.2.4 Dwell times: lengths of maximal runs of the SAME state across consecutive
 #      days (a run is broken by a state change OR a day gap), i.e. how long the
@@ -621,40 +787,57 @@ nice_tbl(dwell, caption = "Dwell time per state (lengths of consecutive-day runs
 
 ## 3.3 Stage 3b (EXPLORATORY): critical-slowing-down before high-SI onset ##
 
-#3.3.1 Identify the empirically highest-SI state as the absorbing "target",
-#      keyed off the data (not a hard-coded label) so it survives GMM
-#      label-switching. Prefer the continuous bother score; fall back to the
-#      first configured primary overlay.
+# WHAT THIS ASKS: dynamical-systems theory (Scheffer) predicts that as a system
+# approaches a tipping point, it recovers more slowly from perturbations -- which
+# shows up as RISING variance and RISING lag-1 autocorrelation (AC1) in the days
+# just before the transition. Here the "transition" is a within-person surge in
+# suicidal ideation. If CSD operates at the daily timescale, the short window of
+# days immediately BEFORE an SI surge should show higher variance / AC1 in the
+# mood+sleep features than ordinary windows. This is the core F31 hypothesis,
+# tested here only as a feasibility probe.
+
 si_metric <- if ("si_bother" %in% names(model_df)) "si_bother" else cfg$overlay$primary[1]
-target_state <- model_df |>
+ew_window <- 3L   # trailing consecutive-day window (kept short; series are brief/gappy)
+
+#3.3.1 Define ONSET as a within-person SI SURGE rather than a categorical state
+#      entry. Categorical entry into the high-SI state is too rare in these short,
+#      gappy series to yield usable windows; a within-person rise in the
+#      continuous SI score past that person's own median (from below it) captures
+#      the same "crossing into a high-SI day" idea with far more events.
+si_by_person <- model_df |>
   dplyr::mutate(state_i = as.integer(as.character(state))) |>
-  dplyr::group_by(state_i) |>
-  dplyr::summarise(m = mean(.data[[si_metric]], na.rm = TRUE), .groups = "drop") |>
-  dplyr::slice_max(m, n = 1, with_ties = FALSE) |>
-  dplyr::pull(state_i)
+  dplyr::group_by(subject) |>
+  dplyr::mutate(si_thresh = stats::median(.data[[si_metric]], na.rm = TRUE)) |>
+  dplyr::ungroup()
+seq_si <- seq_df |>
+  dplyr::left_join(dplyr::select(si_by_person, subject, day, si_thresh,
+                                 si_now = dplyr::all_of(si_metric)),
+                   by = c("subject", "day"))
 
-ew_window <- 4L   # trailing consecutive-day window for variance / AC1 (short by necessity)
-
-#3.3.2 Slide a window of `ew_window` CONSECUTIVE days within each subject; for
-#      each feature compute the window's variance and lag-1 autocorrelation, and
-#      flag whether the day immediately AFTER the window is an entry INTO the
-#      target (high-SI) state. CSD predicts variance and AC1 rise pre-onset.
+#3.3.2 Slide a window of `ew_window` CONSECUTIVE days within each subject; compute
+#      each feature's variance and AC1 in the window, then flag whether the day
+#      immediately AFTER is an SI surge (at/above the person's median, having been
+#      below it on the window's last day).
 ac1 <- function(x) {
   if (length(x) < 3L || stats::sd(x) == 0) return(NA_real_)
   stats::cor(x[-length(x)], x[-1])
 }
 
-ew_rows <- list(); r <- 0L
-for (sdf in split(seq_df, seq_df$subject)) {
+ew_rows <- list(); r <- 0L; n_windows <- 0L; n_onset <- 0L
+for (sdf in split(seq_si, seq_si$subject)) {
   sdf <- sdf[order(sdf$day), ]
   if (nrow(sdf) < ew_window + 1L) next
   for (i in seq_len(nrow(sdf) - ew_window)) {
     win <- sdf[i:(i + ew_window - 1L), ]
     nxt <- sdf[i + ew_window, ]
-    
-    #3.3.2.1 window must be fully consecutive, and `nxt` adjacent to its last day
+    #3.3.2.1 window fully consecutive AND nxt adjacent to its last day
     if (any(diff(win$day) != 1L) || (nxt$day - win$day[ew_window]) != 1L) next
-    onset <- (win$state[ew_window] != target_state) && (nxt$state == target_state)
+    #3.3.2.2 need SI present on the boundary days to define a surge
+    last_si <- win$si_now[ew_window]
+    if (is.na(last_si) || is.na(nxt$si_now) || is.na(nxt$si_thresh)) next
+    n_windows <- n_windows + 1L
+    onset <- (last_si < nxt$si_thresh) && (nxt$si_now >= nxt$si_thresh)
+    if (onset) n_onset <- n_onset + 1L
     for (f in feat_model) {
       r <- r + 1L
       ew_rows[[r]] <- data.frame(feature = f,
@@ -663,36 +846,53 @@ for (sdf in split(seq_df, seq_df$subject)) {
     }
   }
 }
-
 ew <- if (length(ew_rows)) do.call(rbind, ew_rows) else NULL
 
-#3.3.3 Compare indicator levels in pre-onset vs all other windows. With ~30
-#      short, gappy series this is UNDERPOWERED and strictly hypothesis-
-#      generating for the F31 -- read direction and spread, and check the n of
-#      pre-onset windows (the binding constraint), not significance.
-if (!is.null(ew) && nrow(ew) > 0L) {
+#3.3.3 FEASIBILITY FIRST: report how many windows and how many pre-onset windows
+#      exist. This count -- not any p-value -- is the headline; if pre-onset
+#      windows are in the single digits, the boxplots are illustrative only.
+message(glue::glue(
+  "Early-warning feasibility: {n_windows} valid {ew_window}-day windows, ",
+  "of which {n_onset} precede a within-person SI surge ",
+  "(SI metric = {si_metric})."))
+
+#3.3.4 Compare indicator levels in pre-onset vs other windows. Strictly
+#      hypothesis-generating: read DIRECTION (are pre-onset variance/AC1 higher?)
+#      and the pre-onset n, never significance.
+if (!is.null(ew) && n_onset >= 3L) {
   ew_long <- ew |>
     tidyr::pivot_longer(c(variance, ac1), names_to = "indicator", values_to = "value") |>
-    tidyr::drop_na(value)
+    tidyr::drop_na(value) |>
+    dplyr::mutate(window = ifelse(onset, "pre-surge", "other"),
+                  indicator = dplyr::recode(indicator,
+                    variance = "variance (within-window spread)",
+                    ac1 = "lag-1 autocorrelation (recovery slowing)"))
 
   nice_tbl(
     ew_long |>
-      dplyr::group_by(feature, indicator, onset) |>
+      dplyr::group_by(feature, indicator, window) |>
       dplyr::summarise(n = dplyr::n(), mean = mean(value), .groups = "drop"),
     digits = 3,
-    caption = glue::glue("Early-warning indicators: pre-onset vs other windows ",
-                         "(target = highest-SI state {target_state}; window = {ew_window} days)"))
+    caption = glue::glue("Early-warning indicators: pre-surge vs other windows ",
+                         "({ew_window}-day windows; {n_onset} pre-surge windows)"))
 
-  ggplot(ew_long, aes(onset, value, fill = onset)) +
+  ggplot(ew_long, aes(window, value, fill = window)) +
     geom_boxplot(outlier.size = 0.6, width = 0.6) +
-    facet_grid(indicator ~ feature, scales = "free_y") +
+    geom_jitter(width = 0.12, size = 0.5, alpha = 0.3) +
+    facet_grid(indicator ~ feature, scales = "free_y", switch = "y",
+               labeller = ggplot2::label_wrap_gen(width = 18)) +
     scale_fill_viridis_d(end = 0.7, guide = "none") +
-    labs(title = glue::glue("Critical-slowing-down indicators before entering state {target_state}"),
-         subtitle = glue::glue("Exploratory; {ew_window}-day windows; TRUE = window precedes high-SI onset"),
-         x = "Window precedes high-SI onset", y = "Indicator value") +
-    theme_hw()
+    labs(title = "Critical-slowing-down indicators before a within-person SI surge",
+         subtitle = glue::glue("Exploratory; {ew_window}-day windows; ",
+                               "CSD predicts pre-surge > other for BOTH rows"),
+         x = NULL, y = NULL) +
+    theme_hw() +
+    theme(strip.placement = "outside", strip.text.x = element_text(size = 8))
 } else {
-  message("No consecutive ", ew_window, "-day windows available; widen data or shorten ew_window.")
+  message("Too few pre-surge windows (", n_onset,
+          ") for a meaningful comparison; reporting feasibility only. ",
+          "This is itself an F31 result: daily sampling is too sparse to resolve ",
+          "critical slowing down, motivating denser (e.g. multi-daily) EMA.")
 }
 
 ```
@@ -706,23 +906,23 @@ if (!is.null(ew) && nrow(ew) > 0L) {
     (entropy-penalized) and the smallest-mixing-weight diagnostic
     alongside BIC, the person x state artifact check, and the
     person-mean-centered sensitivity refit (Section 2.8) isolating
-    within-person state structure
+    within-person state structure.
 -   Commission-error rate is excluded from the mixture (documented
     above: \~45% zero-error days force degenerate components) and
-    reported as an overlay only
--   The daily EMA mood items are depression and anxiety only; there is
-    no daily elevated-mood/manic item, so states characterize the
+    reported as an overlay only.
+-   The daily EMA mood items are depression and anxiety only -- there is
+    no daily elevated-mood/manic item -- so states characterize the
     depressive/dysregulated axis, with the manic pole captured only
-    indirectly (e.g., via sleep loss)
+    indirectly (e.g., via sleep loss).
 -   Actigraphy was processed with the Sadeh algorithm for most but not
     all participants; the algorithm is a one-line config swap for a
-    Cole-Kripke sensitivity analysis
+    Cole-Kripke sensitivity analysis.
 -   If the criteria prefer K = 1 or states reduce to person identity,
     that is itself a reportable finding about the (lack of) shared
-    multivariate state structure
+    multivariate state structure.
 -   The Stage-3b early-warning (critical-slowing-down) analysis is
     exploratory and underpowered: short, gap-interrupted per-person
     series yield few consecutive pre-onset windows, so it is reported as
     hypothesis-generating preliminary evidence for the F31, not a
     confirmatory test of rising variance / autocorrelation before
-    high-SI transitions
+    high-SI transitions.
