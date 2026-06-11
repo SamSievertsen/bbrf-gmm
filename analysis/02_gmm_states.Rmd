@@ -270,16 +270,30 @@ candidate_k <- if (!is.null(cfg$gmm$candidate_k)) {
 
 ```
 
+```{r gmm_choose_k, warning = FALSE, echo = FALSE}
+
+## 2.4 Lock K from all lenses (config override, else the ICL minimum) ##
+chosen_k <- if (!is.null(cfg$gmm$chosen_k)) cfg$gmm$chosen_k else sel$best_k_icl
+best <- sel$fits[[as.character(chosen_k)]]
+message(glue::glue(
+  "Carrying K = {chosen_k} ",
+  "({ifelse(is.null(cfg$gmm$chosen_k), 'ICL default', 'config override')}). ",
+  "Set cfg$gmm$chosen_k in config to lock it after reviewing the criteria table + curve."))
+
+```
+
 ```{r gmm_density_compare, fig.height = 7, warning = FALSE}
 
-## 2.4 Density-fit comparison across candidate K (the lecture's mixture density) ##
+## 2.5 What each state's distribution looks like (at the chosen K) ##
 
-#2.4.1 1-D marginal mixture density per feature, overlaid on the data histogram
-dens_1d <- purrr::map_dfr(candidate_k, function(k) {
-  fit_k <- sel$fits[[as.character(k)]]
-  purrr::map_dfr(colnames(X), function(f) gmm_marginal_density(fit_k, X, f)) |>
-    dplyr::mutate(K = factor(k))
-})
+#2.5.1 PLOT A: per-feature component densities, one curve PER STATE, over the
+#      data histogram. Reads as: "for this feature, here is each state's density
+#      and where it sits." The summed (mixture) density is the dashed envelope
+comp_dens <- purrr::map_dfr(colnames(X),
+  function(f) gmm_component_density(best, X, f))
+
+mix_dens  <- purrr::map_dfr(colnames(X),
+  function(f) gmm_marginal_density(best, X, f))
 
 model_long <- model_df |>
   dplyr::select(dplyr::all_of(colnames(X))) |>
@@ -288,44 +302,54 @@ model_long <- model_df |>
 ggplot() +
   geom_histogram(data = model_long, aes(value, y = ggplot2::after_stat(density)),
                  bins = 30, fill = "grey88", colour = "white", linewidth = 0.2) +
-  geom_line(data = dens_1d, aes(value, density, colour = K), linewidth = 0.85) +
+  geom_area(data = comp_dens, aes(value, density, fill = state),
+            position = "identity", alpha = 0.35) +
+  geom_line(data = comp_dens, aes(value, density, colour = state), linewidth = 0.7) +
+  geom_line(data = mix_dens, aes(value, density), colour = "grey25",
+            linetype = 2, linewidth = 0.5) +
   facet_wrap(~ feature, scales = "free", ncol = 2) +
-  scale_colour_viridis_d(end = 0.9) +
-  labs(title = "Marginal mixture-density fit by K",
-       subtitle = "Per-feature histogram with each candidate K's fitted marginal density",
+  scale_fill_viridis_d(end = 0.9) + scale_colour_viridis_d(end = 0.9) +
+  labs(title = glue::glue("State distributions by feature (K = {best$K})"),
+       subtitle = "Each colour = one state's weighted Gaussian; dashed grey = full mixture",
        x = NULL, y = "Density") +
   theme_hw()
 
-#2.4.2 Joint density on the mood axis (depression x anxiety) per candidate K
+#2.5.2 PLOT B: the mood plane, coloured by hard state assignment, with each
+#      state's mean marked. Depression x anxiety = the dominant axis
 if (all(c("depression", "anxiety") %in% colnames(X))) {
-  biv <- purrr::map_dfr(candidate_k, function(k) {
-    gmm_bivariate_grid(sel$fits[[as.character(k)]], X, "depression", "anxiety") |>
-      dplyr::mutate(K = factor(k))
-  })
+  state_means <- gmm_state_profile(best, X)
 
-  ggplot() +
-    geom_point(data = model_df, aes(depression, anxiety),
-               alpha = 0.18, size = 0.6, colour = "grey45") +
-    geom_contour(data = biv, aes(x, y, z = density, colour = ggplot2::after_stat(level))) +
-    facet_wrap(~ K) +
-    scale_colour_viridis_c() +
-    labs(title = "Joint mixture density on the mood axis by K",
-         subtitle = "Contours = fitted depression x anxiety density; points = person-days",
-         x = "Depression", y = "Anxiety", colour = "Density") +
+  ggplot(model_df, aes(depression, anxiety)) +
+    geom_point(aes(colour = factor(gmm_map_assign(best))), alpha = 0.5, size = 1.4) +
+    geom_point(data = state_means, aes(depression, anxiety),
+               shape = 21, size = 5, stroke = 1.1, fill = "white", colour = "grey20") +
+    geom_text(data = state_means, aes(depression, anxiety, label = state),
+              size = 3.2, fontface = "bold") +
+    scale_colour_viridis_d(end = 0.9, name = "State") +
+    labs(title = glue::glue("Person-days on the mood plane, by state (K = {best$K})"),
+         subtitle = "Points = person-days (coloured by MAP state); numbered rings = state means",
+         x = "Depression", y = "Anxiety") +
     theme_hw()
 }
 
-```
+#2.5.3 PLOT C: standardized state x feature heatmap (compact fingerprint).
+#      A single grid: rows = states, columns = features, fill = z-mean. Fast read
+#      of "what is high/low in each state" across ALL features at once
+fing_long <- best$mu |>
+  `colnames<-`(colnames(X)) |>
+  tibble::as_tibble() |>
+  dplyr::mutate(state = factor(seq_len(best$K))) |>
+  tidyr::pivot_longer(-state, names_to = "feature", values_to = "z_mean")
 
-```{r gmm_choose_k, warning = FALSE, echo = FALSE}
-
-## 2.5 Lock K from all lenses (config override, else the ICL minimum) ##
-chosen_k <- if (!is.null(cfg$gmm$chosen_k)) cfg$gmm$chosen_k else sel$best_k_icl
-best <- sel$fits[[as.character(chosen_k)]]
-message(glue::glue(
-  "Carrying K = {chosen_k} ",
-  "({ifelse(is.null(cfg$gmm$chosen_k), 'ICL default', 'config override')}). ",
-  "Set cfg$gmm$chosen_k after reviewing the criteria + density plots."))
+ggplot(fing_long, aes(feature, state, fill = z_mean)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%+.1f", z_mean)), size = 3) +
+  scale_fill_gradient2(low = "#3B528B", mid = "grey95", high = "#B8003E",
+                       midpoint = 0, name = "z-mean") +
+  labs(title = glue::glue("State fingerprints (standardized; K = {best$K})"),
+       subtitle = "Fill = standardized mean (0 = sample average); +red above, -blue below",
+       x = NULL, y = "State") +
+  theme_hw() + theme(axis.text.x = element_text(angle = 30, hjust = 1))
 
 ```
 

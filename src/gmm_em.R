@@ -405,7 +405,24 @@ gmm_marginal_density <- function(fit, X, feature, n_grid = 256L) {
   tibble::tibble(feature = feature, value = grid, density = dens)
 }
 
-#6.2 2-D marginal mixture density on a pair of features, in NATIVE units, on a
+#6.2 Per-COMPONENT marginal densities for one feature, native units. Same as
+#     gmm_marginal_density() but keeps each component separate (and scaled by its
+#     mixing weight) so every state is its own labeled curve -- this is what makes
+#     "which bump is which state" legible.
+gmm_component_density <- function(fit, X, feature, n_grid = 256L) {
+  j <- which(colnames(X) == feature)
+  if (length(j) != 1L) stop("feature '", feature, "' not found in colnames(X).")
+  ctr <- attr(X, "center")[j]; scl <- attr(X, "scale")[j]
+  x_native <- X[, j] * scl + ctr
+  grid     <- seq(min(x_native), max(x_native), length.out = n_grid)
+  mu_nat   <- fit$mu[, j] * scl + ctr
+  sd_nat   <- sqrt(vapply(fit$Sigma, function(S) S[j, j], numeric(1))) * scl
+  purrr::map_dfr(seq_len(fit$K), function(k)
+    tibble::tibble(state = factor(k), feature = feature, value = grid,
+                   density = fit$weights[k] * stats::dnorm(grid, mu_nat[k], sd_nat[k])))
+}
+
+#6.3 2-D marginal mixture density on a pair of features, in NATIVE units, on a
 #    regular grid (for contouring). The 2-D marginal of each component is the
 #    bivariate Gaussian with that component's 2-mean and 2x2 sub-covariance;
 #    we evaluate it in standardized space (where the fit lives) and label the
@@ -418,13 +435,13 @@ gmm_bivariate_grid <- function(fit, X, fx, fy, n_grid = 80L) {
   cx <- attr(X, "center")[jx]; sx <- attr(X, "scale")[jx]
   cy <- attr(X, "center")[jy]; sy <- attr(X, "scale")[jy]
   
-  #6.2.1 Native grid; map it back to z-space to use the (z-space) fit parameters
+  #6.3.1 Native grid; map it back to z-space to use the (z-space) fit parameters
   gx <- seq(min(X[, jx] * sx + cx), max(X[, jx] * sx + cx), length.out = n_grid)
   gy <- seq(min(X[, jy] * sy + cy), max(X[, jy] * sy + cy), length.out = n_grid)
   grid <- expand.grid(x = gx, y = gy)
   Z <- cbind((grid$x - cx) / sx, (grid$y - cy) / sy)
   
-  #6.2.2 Weighted sum of bivariate component densities
+  #6.3.2 Weighted sum of bivariate component densities
   dens <- numeric(nrow(grid))
   
   for (k in seq_len(fit$K)) {

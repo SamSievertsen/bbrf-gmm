@@ -71,7 +71,7 @@ default:
     exclude_from_mixture: [commission_elogit]
     commission_doc_k: 4
     candidate_k: [2, 3, 4]
-    chosen_k:
+    chosen_k: 4
 
   # Dynamics (Stage 3) settings
   dynamics:
