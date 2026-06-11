@@ -16,7 +16,7 @@ editor_options:
 knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE, comment = "")
 ```
 
-```{r environment, message = FALSE}
+```{r environment, warning = FALSE, message = FALSE, echo = FALSE}
 
 ## Load packages, source code, and config ##
 
@@ -136,7 +136,7 @@ feat_long |>
 
 ```
 
-```{r stage1_univariate_em}
+```{r stage1_univariate_em, warning = FALSE}
 
 ## Fit a 2-component 1-D GMM to each feature as exploratory structure check ##
 
@@ -178,9 +178,9 @@ none" rather than indexing graded control. On that pre-registered basis
 we exclude it from the mixture and retain it as a descriptive overlay on
 the mood/sleep states. The evidence is kept here for the writeup.
 
-```{r commission_documented_exclusion}
+```{r commission_documented_exclusion, warning = FALSE}
 
-## Why commission is an overlay, not a mixture input (evidence retained) ##
+## Why commission is an overlay, not a mixture input ##
 
 if ("commission_elogit" %in% feat) {
 
@@ -216,7 +216,7 @@ if ("commission_elogit" %in% feat) {
 
 ## 2. Multivariate GMM + model selection
 
-```{r gmm_select_k}
+```{r gmm_select_k, warning = FALSE}
 
 ## Fit across K; compare BIC, AIC, ICL (+ entropy, smallest mixing weight) ##
 
@@ -261,7 +261,7 @@ ggplot(crit_long, aes(K, value, colour = criterion)) +
 
 #2.3 Candidate K set for the density comparison (DYNAMIC; config-overridable).
 #    Defaults to the ICL minimum, the ICL knee, and K=2 if not specified given
-#    its visual relevance derived from the density plots
+#    K=2 relevance derived from viewing the density plots
 candidate_k <- if (!is.null(cfg$gmm$candidate_k)) {
   sort(unique(unlist(cfg$gmm$candidate_k)))
 } else {
@@ -270,7 +270,7 @@ candidate_k <- if (!is.null(cfg$gmm$candidate_k)) {
 
 ```
 
-```{r gmm_density_compare, fig.height = 7}
+```{r gmm_density_compare, fig.height = 7, warning = FALSE}
 
 ## 2.4 Density-fit comparison across candidate K (the lecture's mixture density) ##
 
@@ -317,7 +317,7 @@ if (all(c("depression", "anxiety") %in% colnames(X))) {
 
 ```
 
-```{r gmm_choose_k}
+```{r gmm_choose_k, warning = FALSE, echo = FALSE}
 
 ## 2.5 Lock K from all lenses (config override, else the ICL minimum) ##
 chosen_k <- if (!is.null(cfg$gmm$chosen_k)) cfg$gmm$chosen_k else sel$best_k_icl
@@ -329,7 +329,7 @@ message(glue::glue(
 
 ```
 
-```{r gmm_state_profiles}
+```{r gmm_state_profiles, warning = FALSE}
 
 ## 2.6 What ARE the states? Native-unit profiles + standardized fingerprints ##
 
@@ -360,7 +360,7 @@ ggplot(fing_long, aes(x = z_mean, y = feature, colour = state)) +
 
 ```
 
-```{r gmm_artifact_check}
+```{r gmm_artifact_check, warning = FALSE}
 
 ## 2.7 Person x state check: is any state just one person's days? ##
 chk <- gmm_person_state_check(best, person_id)
@@ -374,7 +374,7 @@ nice_tbl(data.frame(state = seq_along(chk$max_person_share),
 
 ## 3. State characterization, SI overlay, and dynamics
 
-```{r state_overlay}
+```{r state_overlay, warning = FALSE}
 
 ## 3.1 MAP-assign states and overlay SI prevalence (+ commission) per state ##
 
@@ -393,7 +393,7 @@ nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) pr
 
 ```
 
-```{r dynamics, eval = FALSE}
+```{r dynamics, eval = FALSE, warning = FALSE}
 
 ## 3.2 Dynamics (Stage 3): per-person state sequences + early-warning signals ##
 # TODO: for each subject, order states by `day`, then compute

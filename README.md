@@ -9,7 +9,7 @@ analyzed dynamically across each person's 30 days
 
 This is the final project for an ML course, so the learning algorithm is
 **implemented entirely from scratch** (`R/gmm_em.R`): the Gaussian log-density,
-E-step responsibilities, M-step updates, observed-data log-likelihood, BIC model
+E-step responsibilities, M-step updates, observed-data log-likelihood, BIC/ICL model
 selection, and multi-restart initialization are all hand-rolled. No mixture-model
 package (e.g., mclust, mixtools, flexmix, etc.) is used
 
@@ -36,7 +36,7 @@ files under `data/raw/` locally; the pipeline writes the analytic table to
 bbrf-gmm/
 ├── config.yml              # single source of truth (paths, features, GMM settings)
 ├── src/
-│   ├── gmm_em.R            # FROM-SCRATCH GMM/EM (unit-tested) + BIC / AIC / LIC + helpers
+│   ├── gmm_em.R            # FROM-SCRATCH GMM/EM (unit-tested) + BIC / AIC / ICL + helpers
 │   ├── utils.R             # config loader, transforms, IO, SWD ggplot theme
 ├── analysis/
 │   └── 01_build_dataset.R  # clean, config-driven wrangle (run locally, v1)

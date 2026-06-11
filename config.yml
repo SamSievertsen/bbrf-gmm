@@ -57,17 +57,21 @@ default:
   # SI / SB overlay variables
   overlay:
     primary: ["si_any", "si_severity"]
-    secondary: ["si_bother"]
+    secondary: ["si_bother", "commission"]
     rare: ["ACTIVESIWITHINTENT", "SELFHARM", "SUICIDEATTEMPT"]
 
   # GMM / EM settings
   gmm:
-    k_range: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # candidate number of latent states
+    seed: 123
+    k_range: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     n_restarts: 30
     max_iter: 500
-    tol: 1.0e-6
-    ridge: 1.0e-4     # covariance regularization (lambda * I)
-    seed: 123
+    tol: 0.000001
+    ridge: 0.0001
+    exclude_from_mixture: [commission_elogit]
+    commission_doc_k: 4
+    candidate_k: [2, 3, 4]
+    chosen_k:
 
   # Dynamics (Stage 3) settings
   dynamics:
