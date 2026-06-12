@@ -6,13 +6,7 @@
 # (originally by Dani Y. Del Rubin & Scott A. Jones). It reproduces the substantive
 # logic, i.e., joining the daily EMA survey, the daily go/no-go summaries, and
 # actigraphy data,but with modular helpers, dynamic output naming, and a single
-# config switch for the actigraphy algorithm (Sadeh <-> Cole-Kripke).
-#
-# STATUS: v1. The numerical/EM core (gmm_em.R) is unit-tested; THIS script has
-# not yet been run against the real files and will need a local pass to confirm
-# exact column names, encodings, and the relevant (e.g., no-actigraphy) edge cases. 
-# The sleep/nap timing correction (Section 4) is the highest-risk logic and is the 
-# first thing to validate against known cases.
+# config switch for the actigraphy algorithm (Sadeh <-> Cole-Kripke)
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -39,7 +33,7 @@ RAW <- cfg$paths$data_raw
 actig_dir <- file.path(RAW, cfg$sources$actigraphy_root, cfg$actigraphy$algorithm)
 
 
-## 1. Loaders (one small, testable function per source) ##
+## 1. Loaders ##
 
 #1.1 Load the long-format EMA survey (one row per completed survey/person-day)
 load_ema_long <- function(path) {
@@ -86,7 +80,7 @@ load_actigraphy <- function(dir, skip) {
 
 #2.1 Standardize actigraphy column names and build in-bed midpoint timestamps.
 #    Each actigraphy row is a sleep period; we align it to the EMA "day" of the
-#    SUBSEQUENT wake period using the midpoint of the in-bed interval.
+#    SUBSEQUENT wake period using the midpoint of the in-bed interval
 clean_actigraphy <- function(actig) {
   actig %>%
     dplyr::rename(
@@ -300,13 +294,13 @@ build_dataset <- function(cfg) {
       commission_elogit = empirical_logit(commission, n_trials = cfg$cognition$n_nogo_trials))
   
   #4.1.7 Within-person variability scaffolding at rolling window from config
-  w  <- cfg$dynamics$ews_window
+  w <- cfg$dynamics$ews_window
   cv <- function(v) stats::sd(v, na.rm = TRUE) / mean(v, na.rm = TRUE)
   daily <- daily %>%
     dplyr::group_by(subject) %>%
     dplyr::arrange(day, .by_group = TRUE) %>%
     dplyr::mutate(
-      sleepeff_movingcv = zoo::rollapply(sleep_eff,    w, cv, fill = NA, align = "right"),
+      sleepeff_movingcv = zoo::rollapply(sleep_eff, w, cv, fill = NA, align = "right"),
       sleeptime_movingcv = zoo::rollapply(hrs_to_sleep, w, cv, fill = NA, align = "right")) %>%
     dplyr::ungroup()
   

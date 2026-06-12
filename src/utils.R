@@ -2,7 +2,7 @@
 # utils.R
 # Shared, dependency-light utilities used across the wrangle, analysis, and
 # tests: config loading, feature transforms, defensive IO, and a decluttered
-# ggplot theme aligned with Storytelling-with-Data principles.
+# ggplot theme
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -136,7 +136,7 @@ theme_hw <- function() {
       strip.text = ggplot2::element_text(face = "bold"))
 }
 
-## 5. Presentation & model-interpretation helpers ##
+## 5. Presentation & model-interpretation helper functions ##
 
 #5.1 nice_tbl(): clean kable + kableExtra styling
 nice_tbl <- function(x, caption = NULL, digits = 3, stripe = FALSE) {

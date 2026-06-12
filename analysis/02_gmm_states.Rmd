@@ -176,7 +176,8 @@ only by spawning near-zero-variance components anchored at the
 error-rate floor. In other words, it sorts days into "any errors vs
 none" rather than indexing graded control. On that pre-registered basis
 we exclude it from the mixture and retain it as a descriptive overlay on
-the mood/sleep states. The evidence is kept here for the writeup.
+the mood/sleep states. The evidence is kept here for the writeup and 
+posterity
 
 ```{r commission_documented_exclusion, warning = FALSE}
 
@@ -198,13 +199,13 @@ if ("commission_elogit" %in% feat) {
            caption = glue::glue("Commission INCLUDED (K = {k_doc}): per-feature discrimination ",
                                "(commission's ratio is inflated by a near-zero-variance spike)"))
 
-  #C.3 The smoking gun: states whose commission var_z sits at the ridge are the
+  #C.3 States whose commission var_z sits at the ridge are the
   #    degenerate zero-error spike(s)
   ci <- which(colnames(X_doc) == "commission_elogit")
   nice_tbl(tibble::tibble(
     state = factor(seq_len(fit_doc$K)),
     mean_z = round(fit_doc$mu[, ci], 2),
-    var_z  = round(vapply(fit_doc$Sigma, function(S) S[ci, ci], numeric(1)), 4),
+    var_z = round(vapply(fit_doc$Sigma, function(S) S[ci, ci], numeric(1)), 4),
     weight = round(fit_doc$weights, 3)),
     caption = "commission_elogit by state (var_z near the GMM ridge => degenerate spike)")
 
@@ -233,12 +234,37 @@ nice_tbl(sel$bic_table,
          caption = "Model selection across K (BIC, AIC, ICL, entropy, min mixing weight)",
          digits = 1)
 
+#2.0b Degeneracy guard: a component whose mixing weight collapses toward 0 is a
+#     GMM over-fit, in that EM spins up a near-empty Gaussian to wrap a few
+#     points and shave a small amount of likelihood. Such solutions can "win" BIC/
+#     ICL (especially with many restarts, which make the knife-edge easier to
+#     find) yet describe no real subgroup. We flag any K whose smallest weight
+#     implies fewer than ~5 effective person-days as degenerate and exclude it
+#     from consideration
+min_days_floor <- 5L
+sel_diag <- sel$bic_table |>
+  dplyr::mutate(min_state_days = round(min_weight * nrow(X)),
+                degenerate = min_state_days < min_days_floor)
+nice_tbl(sel_diag |> dplyr::select(K, min_weight, min_state_days, degenerate),
+         caption = glue::glue("Component-health check: K with a state holding < ",
+                              "{min_days_floor} effective person-days are degenerate"),
+         digits = 3)
+
+#2.0c Non-degenerate BIC/ICL minima (the defensible selection targets)
+ok <- !sel_diag$degenerate
+bic_k_ok <- sel_diag$K[ok][which.min(sel_diag$bic[ok])]
+icl_k_ok <- sel_diag$K[ok][which.min(sel_diag$icl[ok])]
+
 #2.1 Objective knees on the BIC and ICL curves
 k_knee_bic <- kneedle(sel$bic_table$K, sel$bic_table$bic)
 k_knee_icl <- kneedle(sel$bic_table$K, sel$bic_table$icl)
 
-message(glue::glue("BIC min K={sel$best_k} | ICL min K={sel$best_k_icl} | ",
+message(glue::glue("RAW: BIC min K={sel$best_k} | ICL min K={sel$best_k_icl} | ",
                    "Kneedle(BIC) K={k_knee_bic} | Kneedle(ICL) K={k_knee_icl}"))
+message(glue::glue("NON-DEGENERATE: BIC min K={bic_k_ok} | ICL min K={icl_k_ok} ",
+                   "(min weight >= {min_days_floor}/{nrow(X)} person-days). ",
+                   "Penalty criteria are unreliable here (autocorrelated rows + ",
+                   "degenerate high-K wins); person-blocked CV (2.9.4) is decisive."))
 
 #2.2 BIC vs ICL: ICL adds an overlap/entropy penalty, so it resists the
 #    over-splitting BIC shows when the mixture tiles density rather than finding
@@ -272,13 +298,104 @@ candidate_k <- if (!is.null(cfg$gmm$candidate_k)) {
 
 ```{r gmm_choose_k, warning = FALSE, echo = FALSE}
 
-## 2.4 Lock K from all lenses (config override, else the ICL minimum) ##
+## 2.4 Lock K (config override, else the non-degenerate ICL minimum) ##
 chosen_k <- if (!is.null(cfg$gmm$chosen_k)) cfg$gmm$chosen_k else sel$best_k_icl
 best <- sel$fits[[as.character(chosen_k)]]
 message(glue::glue(
   "Carrying K = {chosen_k} ",
   "({ifelse(is.null(cfg$gmm$chosen_k), 'ICL default', 'config override')}). ",
   "Set cfg$gmm$chosen_k in config to lock it after reviewing the criteria table + curve."))
+
+```
+
+```{r kmeans_baseline, fig.height = 4, warning = FALSE}
+
+## 2.4b K-means baseline + distance-based validation (WSS elbow, silhouette) ##
+
+# WHY: k-means is the hard-assignment, spherical-equal-covariance special case of
+# a GMM, so it is a good baseline and shows what the Gaussian architecture
+# (soft assignments + full per-state covariance) actually buys. Its standard
+# validity indices are DISTANCE-based (WSS elbow, silhouette), an objective
+# entirely independent of the likelihood-based BIC/ICL/CV used for the GMM. If
+# the distance view also favours a small K near 4, that is convergent evidence
+# from a different criterion; if not, it is an honest robustness caveat
+
+km_k <- 2:10
+set.seed(cfg$gmm$seed)
+
+#2.4b.1 Fit k-means at each K (many restarts via nstart for stable WSS)
+km_fits <- lapply(km_k, function(k)
+  stats::kmeans(X, centers = k, nstart = 25, iter.max = 100))
+names(km_fits) <- km_k
+
+#2.4b.2 Average silhouette width FROM SCRATCH (no cluster/factoextra dependency).
+#       s(i) = (b_i - a_i) / max(a_i, b_i): a_i = mean dist to own-cluster points,
+#       b_i = min over other clusters of mean dist to that cluster. Computed on a
+#       capped random subsample for an O(m^2) distance matrix
+avg_silhouette <- function(Xmat, cl) {
+  n <- nrow(Xmat)
+  D <- as.matrix(stats::dist(Xmat))
+  ks <- sort(unique(cl))
+  sil <- numeric(n)
+  for (i in seq_len(n)) {
+    own <- cl == cl[i]; own[i] <- FALSE
+    a_i <- if (any(own)) mean(D[i, own]) else 0
+    b_i <- min(vapply(setdiff(ks, cl[i]), function(g) mean(D[i, cl == g]), numeric(1)))
+    sil[i] <- if (max(a_i, b_i) > 0) (b_i - a_i) / max(a_i, b_i) else 0
+  }
+  mean(sil)
+}
+
+#2.4b.3 Subsample cap for the silhouette distance matrix (reproducible)
+m_cap <- min(nrow(X), 600L)
+sil_idx <- sample(seq_len(nrow(X)), m_cap)
+
+km_val <- tibble::tibble(
+  K = km_k,
+  wss = vapply(km_fits, function(f) f$tot.withinss, numeric(1)),
+  silhouette = vapply(km_k, function(k)
+    avg_silhouette(X[sil_idx, , drop = FALSE], km_fits[[as.character(k)]]$cluster[sil_idx]),
+    numeric(1)))
+
+km_sil_best <- km_val$K[which.max(km_val$silhouette)]
+message(glue::glue("K-means: peak average silhouette at K={km_sil_best} ",
+                   "(GMM chosen K={chosen_k}). WSS elbow read from the curve below."))
+
+nice_tbl(km_val, digits = c(0, 1, 3),
+         caption = "K-means validation: within-cluster SS (elbow) and average silhouette width")
+
+#2.4b.4 Twin curves: WSS (lower, look for the elbow) and silhouette (higher = more
+#       separated, distinct clusters)
+km_long <- km_val |>
+  tidyr::pivot_longer(c(wss, silhouette), names_to = "metric", values_to = "value") |>
+  dplyr::mutate(metric = dplyr::recode(metric,
+                  wss = "Within-cluster SS (elbow)",
+                  silhouette = "Avg silhouette (higher = better)"))
+
+ggplot(km_long, aes(K, value)) +
+  geom_line(colour = "grey70", linewidth = 0.6) +
+  geom_point(size = 2.3, colour = "grey45") +
+  geom_point(data = dplyr::filter(km_long, K == chosen_k), size = 4, colour = "#21908C") +
+  facet_wrap(~ metric, scales = "free_y") +
+  scale_x_continuous(breaks = km_k) +
+  labs(title = "K-means distance-based validation",
+       subtitle = glue::glue("Teal = GMM's chosen K={chosen_k}; ",
+                             "silhouette peak at K={km_sil_best}"),
+       x = "Number of clusters (K)", y = NULL) +
+  theme_hw()
+
+#2.4b.5 Concordance with the GMM partition at the chosen K (adjusted Rand index):
+#       do the soft Gaussian states and the hard k-means clusters largely agree?
+adjusted_rand_km <- function(a, b) {
+  tab <- table(a, b); cc <- function(x) choose(x, 2)
+  sij <- sum(cc(tab)); si <- sum(cc(rowSums(tab))); sj <- sum(cc(colSums(tab)))
+  expected <- si * sj / cc(sum(tab)); maxidx <- (si + sj) / 2
+  (sij - expected) / (maxidx - expected)
+}
+ari_km_gmm <- adjusted_rand_km(gmm_map_assign(best),
+                               km_fits[[as.character(chosen_k)]]$cluster)
+message(glue::glue("GMM vs k-means agreement at K={chosen_k}: adjusted Rand index = ",
+                   "{round(ari_km_gmm, 3)} (1 = identical partitions)."))
 
 ```
 
@@ -384,6 +501,75 @@ ggplot(fing_long, aes(x = z_mean, y = feature, colour = state)) +
 
 ```
 
+```{r gmm_pca_density_overlay, fig.height = 5.5, warning = FALSE}
+
+## 2.6b Multivariate state densities, projected to 2-D via PCA ##
+
+# The states are 5-D Gaussians; to SEE them as overlapping multivariate
+# densities we project to 2-D. PCA is the faithful choice: it is a LINEAR
+# projection, so each fitted component's mean and covariance map exactly onto the
+# plane (mu -> V'mu, Sigma -> V'Sigma V, V = top-2 loadings). We are NOT
+# refitting in 2-D, just viewing the ACTUAL 5-D fit from a different angle.
+
+#2.6b.1 PCA on the standardized modeling matrix the GMM was fit on (already
+#       z-scored, so prcomp neither centers again nor rescales)
+pca <- stats::prcomp(X, center = FALSE, scale. = FALSE)
+V <- pca$rotation[, 1:2]
+var_pc <- round(100 * (pca$sdev^2 / sum(pca$sdev^2))[1:2], 1)
+
+#2.6b.2 Project data + each component's mean and covariance onto the plane
+scores <- as.data.frame(X %*% V); colnames(scores) <- c("PC1", "PC2")
+scores$state <- factor(gmm_map_assign(best))
+mu_proj <- best$mu %*% V
+Sig_proj <- lapply(best$Sigma, function(S) t(V) %*% S %*% V)
+
+#2.6b.3 Covariance ellipse FROM SCRATCH: eigen-decompose the projected 2x2
+#       covariance; axis half-lengths = sqrt(eigenvalue) * sqrt(qchisq(level, 2))
+#       oriented by the eigenvectors. This contour encloses `level` of that
+#       Gaussian's mass (verified: simulated draws fall inside at the nominal rate)
+ellipse_pts <- function(mu2, S2, level = 0.68, n = 80) {
+  eg <- eigen(S2, symmetric = TRUE)
+  rad <- sqrt(stats::qchisq(level, df = 2))
+  theta <- seq(0, 2 * pi, length.out = n)
+  pts <- eg$vectors %*% diag(rad * sqrt(pmax(eg$values, 0))) %*% rbind(cos(theta), sin(theta))
+  data.frame(PC1 = mu2[1] + pts[1, ], PC2 = mu2[2] + pts[2, ])
+}
+
+ell_df <- purrr::map_dfr(seq_len(best$K), function(k) {
+  dplyr::bind_rows(
+    dplyr::mutate(ellipse_pts(mu_proj[k, ], Sig_proj[[k]], 0.68), level = "68%"),
+    dplyr::mutate(ellipse_pts(mu_proj[k, ], Sig_proj[[k]], 0.95), level = "95%")) |>
+    dplyr::mutate(state = factor(k))
+})
+cent_df <- data.frame(PC1 = mu_proj[, 1], PC2 = mu_proj[, 2], state = factor(seq_len(best$K)))
+
+#2.6b.4 Scatter (MAP-coloured) + 68%/95% density ellipses + labelled centroids.
+#       Ellipse overlap = density overlap in-plane; size/tilt = each states
+#       spread and feature covariance
+ggplot(scores, aes(PC1, PC2, colour = state)) +
+  geom_point(alpha = 0.35, size = 1.1) +
+  geom_path(data = ell_df, aes(group = interaction(state, level), linetype = level),
+            linewidth = 0.7) +
+  geom_point(data = cent_df, size = 4, shape = 21, fill = "white", stroke = 1.1) +
+  geom_text(data = cent_df, aes(label = state), colour = "black",
+            fontface = "bold", size = 3.2) +
+  scale_colour_viridis_d(end = 0.9, name = "State") +
+  scale_linetype_manual(values = c("68%" = 1, "95%" = 3), name = "Density contour") +
+  coord_equal() +
+  labs(title = "Multivariate state densities projected onto PC1-PC2",
+       subtitle = glue::glue("Ellipses = fitted Gaussian contours; PC1 {var_pc[1]}% + ",
+                             "PC2 {var_pc[2]}% = {round(sum(var_pc), 1)}% of variance"),
+       x = glue::glue("PC1 ({var_pc[1]}%)"), y = glue::glue("PC2 ({var_pc[2]}%)")) +
+  theme_hw()
+
+#2.6b.5 PC loadings: which features define the projection plane
+nice_tbl(
+  tibble::as_tibble(round(pca$rotation[, 1:2], 2), rownames = "feature"),
+  caption = glue::glue("PC1/PC2 loadings (PC1 = {var_pc[1]}%, PC2 = {var_pc[2]}% ",
+                       "of variance): how features define the projection plane"))
+
+```
+
 ```{r gmm_artifact_check, warning = FALSE}
 
 ## 2.7 Person x state check: is any state just one person's days? ##
@@ -398,27 +584,27 @@ nice_tbl(data.frame(state = seq_along(chk$max_person_share),
 
 ## 2.8 Sensitivity: within-person (person-mean-centered) refit
 
-The primary model is fit on raw (across-sample standardized) person-days, so a
-fair objection is that the states might be sorting *people* (chronically
+The primary model is fit on raw (i.e., across-sample standardized) person-days,
+so a fair objection is that the states might be sorting people (e.g., chronically
 high-distress vs chronically euthymic individuals) rather than capturing
-*within-person day-to-day shifts* -- the latter being the dynamical-systems
+within-person day-to-day shifts; the latter being the dynamical-systems
 claim we actually want to make. The artifact check already shows no state is one
-person's days; this sensitivity goes further by asking whether the same state
-structure survives when **all** stable between-person differences are removed.
+person's days, & this sensitivity goes further by asking whether the same state
+structure survives when all stable between-person differences are removed
 
 Two reads. First, the per-feature **ICC(1)** quantifies how much of each
-feature's variance is between-person (trait) vs within-person (state); the lower
-the ICC, the more a feature reflects genuine day-to-day movement, and the more
+feature's variance is between-person (trait) vs within-person (state). The lower
+the ICC, the more a feature reflects legit day-to-day movement, and the more
 defensible the uncentered model is as the primary. Second, we refit the entire
-GMM on **person-mean-centered** features (each day expressed relative to that
-person's own average) and ask whether (a) model selection still prefers a
+GMM on person-mean-centered features, with each day expressed relative to that
+person's own average, and ask whether (a) model selection still prefers a
 comparable K, (b) the centered states show the same qualitative fingerprints,
 and (c) the day-level assignments agree with the primary solution (adjusted Rand
-index). We do not expect *identical* partitions -- centering deliberately moves a
-chronically-depressed person's average day off the high-distress state -- so the
+index). We do not expect identical partitions bc centering deliberately moves a
+chronically-depressed person's average day off the high-distress state, so the
 scientific question is whether a recognizable distress/euthymic structure
-*re-emerges from purely within-person variation*, which is exactly the claim the
-dynamical framing needs.
+re-emerges from purely within-person variation, which is a claim the
+dynamical framing needs
 
 ```{r centered_icc, warning = FALSE}
 
@@ -427,13 +613,13 @@ dynamical framing needs.
 #2.8.1 One-way random-effects ICC via base-R aov (no new dependencies). High ICC
 #      => the feature mostly separates people (trait-like); low ICC => it mostly
 #      tracks within-person change (state-like, the signal we want). k0 is the
-#      unbalanced-design average group size.
+#      unbalanced-design average group size
 icc1 <- function(value, group) {
   group <- factor(group)
   ni <- table(group); g <- length(ni); N <- length(value)
-  ms  <- summary(stats::aov(value ~ group))[[1]][, "Mean Sq"]
+  ms <- summary(stats::aov(value ~ group))[[1]][, "Mean Sq"]
   msb <- ms[1]; msw <- ms[2]
-  k0  <- (N - sum(ni^2) / N) / (g - 1)
+  k0 <- (N - sum(ni^2) / N) / (g - 1)
   max((msb - msw) / (msb + (k0 - 1) * msw), 0)         # floor at 0
 }
 
@@ -455,11 +641,11 @@ nice_tbl(icc_tbl,
 #2.8.2.1 Strip each person's own mean from every modeling feature, then
 #        re-standardize so the centered matrix carries the center/scale
 #        attributes the profilers need. Centered features encode "this day vs
-#        this person's average," removing all stable between-person differences.
+#        this person's average," removing all stable between-person differences
 Xc <- zscore_matrix(person_center(model_df[, feat_model], person_id))
 
 #2.8.2.2 Run the SAME selection machinery on the centered data: does centering
-#        change the preferred K? (structure stability across the four lenses)
+#        change the preferred K?
 sel_c <- gmm_select_k(
   Xc, k_range = unlist(cfg$gmm$k_range), n_restarts = cfg$gmm$n_restarts,
   max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol, ridge = cfg$gmm$ridge,
@@ -499,7 +685,7 @@ ggplot(fing_c_long, aes(feature, state, fill = z_mean)) +
 
 #2.8.3.1 Adjusted Rand index from scratch: partition agreement corrected for
 #        chance (0 = chance, 1 = identical). Invariant to label permutation, so
-#        it sidesteps GMM label-switching between the two fits.
+#        it sidesteps GMM label-switching between the two fits
 adjusted_rand <- function(a, b) {
   tab <- table(a, b); cc <- function(x) choose(x, 2)
   sij <- sum(cc(tab)); si <- sum(cc(rowSums(tab))); sj <- sum(cc(colSums(tab)))
@@ -507,7 +693,7 @@ adjusted_rand <- function(a, b) {
   (sij - expected) / (maxidx - expected)
 }
 
-state_primary  <- gmm_map_assign(best)
+state_primary <- gmm_map_assign(best)
 state_centered <- gmm_map_assign(best_c)
 ari <- adjusted_rand(state_primary, state_centered)
 
@@ -533,36 +719,33 @@ nice_tbl(
 
 ## 2.9 EM verification & density-estimation adequacy
 
-The mixture is hand-implemented, so before any scientific claim we verify the
-*algorithm* and the *density estimate* separately. Four checks, each targeting a
-distinct failure mode:
+The mixture is hand-implemented, so before any scientific claim we need to verify the
+algorithm and the density estimate separately. Four checks, each targeting a
+distinct potential point of failure:
 
-1. **EM monotonicity** -- EM provably never decreases the observed-data
+1. **EM monotonicity**: EM never decreases the observed-data
    log-likelihood; a single decrease in the iteration trace means the
-   implementation is wrong. This is the sharpest single correctness test
-   available without a reference library.
-2. **Restart stability** -- EM only finds local optima. If the 30 restarts
+   implementation is wrong
+2. **Restart stability**: EM only finds local optima. If the 50 restarts
    scatter across many distinct log-likelihood values, the reported solution is
    initialization luck; if most restarts reach the same best mode, the optimum
-   is reliable.
-3. **Posterior predictive check (PPC)** -- a good *density estimate* must be
-   able to regenerate the data. We simulate person-days from the fitted mixture
+   is reliable
+3. **Posterior predictive check (PPC)**: a good density estimate must be
+   able to regenerate the data. We thus simulate person-days from the fitted mixture
    and compare simulated vs observed marginals and the full correlation
-   structure (the joint dependence is what a multivariate GMM buys over per-
-   feature fits). PIT values (the fitted marginal CDF evaluated at each
-   observation) should be approximately Uniform(0,1) if the marginals fit.
-4. **Person-blocked cross-validated log-likelihood** -- the direct, assumption-
+   structure. PIT values, AKA the fitted marginal CDF evaluated at each
+   observation, should be approximately Uniform(0,1) if the marginals fit.
+4. **Person-blocked cross-validated log-likelihood**: a direct, assumption-
    free answer to "BIC's penalty assumes independent rows." Held-out density
-   (fit on most people, score the held-out people's days) makes no effective-N
-   assumption: if K = 4 generalizes to unseen *people*, its held-out
-   log-likelihood should be competitive, and overfit K should drop.
+   makes no effective-N assumption and if K = 4 generalizes to unseen people, 
+   its held-out log-likelihood should be competitive, and overfit K should drop
 
 ```{r em_verification, fig.height = 4, warning = FALSE}
 
 ## 2.9.1 EM correctness: monotone log-likelihood + restart stability ##
 
 #2.9.1.1 Monotonicity audit on the chosen fit's iteration trace. Tolerance 1e-8
-#        absorbs floating-point noise only; any real decrease fails loudly.
+#        absorbs floating-point noise only
 ll_tr <- best$log_lik_trace
 mono_viol <- sum(diff(ll_tr) < -1e-8)
 message(glue::glue(
@@ -577,7 +760,7 @@ ggplot(data.frame(iter = seq_along(ll_tr), loglik = ll_tr), aes(iter, loglik)) +
   theme_hw()
 
 #2.9.1.2 Restart stability: final log-lik of every restart at the chosen K.
-#        "Modal share" = fraction of restarts landing within 1e-3 of the best.
+#        "Modal share" = fraction of restarts landing within 1e-3 of the best
 rl <- best$restart_loglik[is.finite(best$restart_loglik)]
 modal_share <- mean(rl > max(rl) - 1e-3)
 message(glue::glue(
@@ -611,7 +794,7 @@ ppc_long <- dplyr::bind_rows(
     dplyr::mutate(source = "simulated"))
 
 #2.9.2.2 Overlay: simulated density should trace the observed histogram. Misfit
-#        shows as systematic gaps (e.g., unmodeled skew or floors).
+#        shows as systematic gaps (e.g., unmodeled skew or floors)
 ggplot() +
   geom_histogram(data = dplyr::filter(ppc_long, source == "observed"),
                  aes(value, y = ggplot2::after_stat(density)),
@@ -625,11 +808,12 @@ ggplot() +
   theme_hw()
 
 #2.9.2.3 Joint structure: the simulated CORRELATION matrix must match the
-#        observed one (this is what the full covariance components buy). Report
-#        the worst absolute discrepancy across all feature pairs.
+#        observed one Report the worst absolute discrepancy across all 
+#        feature pairs
 cor_obs <- stats::cor(X)
 cor_sim <- stats::cor(sim$X)
 cor_diff <- cor_sim - cor_obs
+
 message(glue::glue(
   "PPC correlation recovery: max |simulated - observed| correlation = ",
   "{round(max(abs(cor_diff[upper.tri(cor_diff)])), 3)} across ",
@@ -664,14 +848,14 @@ ggplot(cor_long, aes(f2, f1, fill = r)) +
 #2.9.3.1 For feature j, the fitted marginal CDF is sum_k w_k * pnorm(x; mu_kj,
 #        sd_kj) (computed in z-space, where the fit lives). If the marginal
 #        density is right, the CDF evaluated at the data is ~ Uniform(0, 1):
-#        flat PIT histogram. Humps/edge spikes localize misfit.
+#        flat PIT histogram. Humps/edge spikes = misfit
 pit_long <- purrr::map_dfr(seq_len(ncol(X)), function(j) {
   pit <- rowSums(vapply(seq_len(best$K), function(k)
-    best$weights[k] * stats::pnorm(X[, j], best$mu[k, j],
-                                   sqrt(best$Sigma[[k]][j, j])),
-    numeric(nrow(X))))
+    best$weights[k] * stats::pnorm(X[, j], best$mu[k, j], sqrt(best$Sigma[[k]][j, j])), numeric(nrow(X))))
   ks <- suppressWarnings(stats::ks.test(pit, "punif")$statistic)
-  tibble::tibble(feature = colnames(X)[j], pit = pit, ks = round(ks, 3))
+  tibble::tibble(feature = colnames(X)[j],
+                 pit = pit,
+                 ks = round(ks, 3))
 })
 
 nice_tbl(dplyr::distinct(pit_long, feature, ks) |> dplyr::arrange(ks),
@@ -694,10 +878,9 @@ ggplot(pit_long, aes(pit)) +
 ## 2.9.4 Person-blocked cross-validated log-likelihood across K ##
 
 #2.9.4.1 5 folds of SUBJECTS (never split a person across train/test), so the
-#        score asks: does the K-state density generalize to unseen PEOPLE? This
-#        is the independence-assumption-free counterpart to BIC. Standardization
-#        is re-estimated within each training fold and projected onto the test
-#        fold (no leakage).
+#        score asks: does the K-state density generalize to unseen PEOPLE?
+#        Standardization is re-estimated within each training fold and projected
+#        onto the test fold (for no leakage)
 set.seed(cfg$gmm$seed)
 subj_all <- unique(person_id)
 folds <- split(sample(subj_all), rep_len(1:5, length(subj_all)))
@@ -706,18 +889,28 @@ n_restarts_cv <- 10L   # fewer restarts per fold to bound runtime; stability ok 
 
 M_raw <- as.matrix(model_df[, feat_model])
 cv_rows <- list(); i <- 0L
+
 for (K in k_cv) {
+  
   for (f in seq_along(folds)) {
     te_idx <- person_id %in% folds[[f]]
     Ztr <- zscore_matrix(M_raw[!te_idx, , drop = FALSE])
-    Zte <- sweep(sweep(M_raw[te_idx, , drop = FALSE], 2L, attr(Ztr, "center"), "-"),
-                 2L, attr(Ztr, "scale"), "/")
-    fit_f <- gmm_em_fit(Ztr, K, n_restarts = n_restarts_cv,
-                        max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol,
-                        ridge = cfg$gmm$ridge, seed = cfg$gmm$seed + 100L * K + f)
+    Zte <- sweep(sweep(M_raw[te_idx, , drop = FALSE], 2L, attr(Ztr, "center"), "-"), 2L, attr(Ztr, "scale"), "/")
+    fit_f <- gmm_em_fit(
+      Ztr,
+      K,
+      n_restarts = n_restarts_cv,
+      max_iter = cfg$gmm$max_iter,
+      tol = cfg$gmm$tol,
+      ridge = cfg$gmm$ridge,
+      seed = cfg$gmm$seed + 100L * K + f)
+    
     i <- i + 1L
-    cv_rows[[i]] <- data.frame(K = K, fold = f, n_test = sum(te_idx),
-                               ll = gmm_loglik(fit_f, Zte))
+    cv_rows[[i]] <- data.frame(
+      K = K,
+      fold = f,
+      n_test = sum(te_idx),
+      ll = gmm_loglik(fit_f, Zte))
   }
 }
 
@@ -731,6 +924,7 @@ cv <- do.call(rbind, cv_rows) |>
                    .groups = "drop")
 
 k_cv_best <- cv$K[which.max(cv$mean_ll)]
+
 message(glue::glue(
   "Person-blocked CV: held-out log-lik/day peaks at K = {k_cv_best} ",
   "(chosen K = {chosen_k})."))
@@ -765,10 +959,9 @@ overlay_vars <- intersect(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$over
                           names(model_df))
 state_overlay <- model_df |>
   dplyr::group_by(state) |>
-  dplyr::summarise(
-    n_days = dplyr::n(),
-    dplyr::across(dplyr::all_of(overlay_vars), ~ mean(.x, na.rm = TRUE)),
-    .groups = "drop")
+  dplyr::summarise(n_days = dplyr::n(),
+                   dplyr::across(dplyr::all_of(overlay_vars), ~ mean(.x, na.rm = TRUE)),
+                   .groups = "drop")
 
 nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) profile by latent state")
 
@@ -780,18 +973,18 @@ nice_tbl(state_overlay, digits = 3, caption = "SI/SB (and commission overlay) pr
 
 #3.2.1 Decode each subject's MAP-state sequence ordered by study day. `day` is a
 #      1-30 study-day index, so consecutive days differ by exactly 1; a larger
-#      gap is a missed EMA day and must NOT be read as a transition.
+#      gap is a missed EMA day and must NOT be read as a transition
 seq_df <- model_df |>
   dplyr::mutate(state = as.integer(as.character(state))) |>
   dplyr::arrange(subject, day) |>
   dplyr::group_by(subject) |>
   dplyr::mutate(prev_state = dplyr::lag(state),
-                prev_day   = dplyr::lag(day),
+                prev_day = dplyr::lag(day),
                 consecutive = !is.na(prev_day) & (day - prev_day == 1L)) |>
   dplyr::ungroup()
 
 #3.2.2 Person x day state raster: each row a subject, each column a study day,
-#      coloured by MAP state (blank = missing day). The raw trajectory material.
+#      coloured by MAP state (blank = missing day)
 ggplot(seq_df, aes(day, factor(subject), fill = factor(state))) +
   geom_tile(colour = "grey95", linewidth = 0.2) +
   scale_fill_viridis_d(end = 0.9, name = "State") +
@@ -803,14 +996,15 @@ ggplot(seq_df, aes(day, factor(subject), fill = factor(state))) +
 #3.2.2b Assignment confidence: mean max-responsibility per state. Values near 1
 #       mean confident hard assignments (well-separated states); values near 1/K
 #       mean fuzzy assignments, in which case rapid day-to-day "switching" is
-#       partly soft-assignment noise rather than true state change.
+#       partly soft-assignment noise rather than true state change
 conf_df <- tibble::tibble(state = factor(gmm_map_assign(best)),
                           max_resp = gmm_max_resp(best)) |>
   dplyr::group_by(state) |>
-  dplyr::summarise(n_days = dplyr::n(),
-                   mean_max_resp = round(mean(max_resp), 3),
-                   pct_confident = round(100 * mean(max_resp > 0.8), 1),
-                   .groups = "drop")
+  dplyr::summarise(
+    n_days = dplyr::n(),
+    mean_max_resp = round(mean(max_resp), 3),
+    pct_confident = round(100 * mean(max_resp > 0.8), 1),
+    .groups = "drop")
 
 nice_tbl(conf_df,
          caption = glue::glue("MAP-assignment confidence per state (1/K = {round(1/best$K, 2)} ",
@@ -825,15 +1019,15 @@ nice_tbl(conf_df,
 #3.2b.1 Two separate figures so neither encoding is squeezed: (A) the primary
 #       CONTINUOUS metric (si_bother) as a size/opacity dot overlay; (B) the
 #       BINARY events on one panel, distinguished by SHAPE. Deliberately omitted:
-#       si_severity (near-collinear with si_bother -- same construct, coarser
+#       si_severity (near-collinear with si_bother, and is the same construct, coarser
 #       scale) and ACTIVESIWITHINTENT (~constant near 1 across all states in the
-#       overlay table, so it carries no discriminating signal here).
+#       overlay table, so it carries no discriminating signal here)
 si_cont_metric <- "si_bother"
 si_event_vars  <- intersect(c("si_any", "SELFHARM", "SUICIDEATTEMPT"), names(seq_df))
 
 #3.2b.2 FIGURE A: state raster + continuous SI dots. Tile = MAP state
-#       (desaturated so the overlay reads); dot size AND opacity scale with the
-#       day's si_bother, so high-SI days pop and zero-SI days vanish.
+#       dot size AND opacity scale with the day's si_bother, so high-SI 
+#       days pop and zero-SI days vanish
 ggplot(seq_df, aes(day, factor(subject))) +
   geom_tile(aes(fill = factor(state)), colour = "grey95",
             linewidth = 0.15, alpha = 0.55) +
@@ -855,7 +1049,7 @@ ggplot(seq_df, aes(day, factor(subject))) +
 
 #3.2b.3 FIGURE B: binary suicidality EVENTS on the same raster, one panel,
 #       distinguished by shape (legend). Plotted rarest-last so attempts/self-
-#       harm sit on top of the (frequent) si_any marks.
+#       harm sit on top of the (frequent) si_any marks
 events_long <- seq_df |>
   dplyr::select(subject, day, state, dplyr::all_of(si_event_vars)) |>
   tidyr::pivot_longer(dplyr::all_of(si_event_vars),
@@ -874,17 +1068,17 @@ ggplot(seq_df, aes(day, factor(subject))) +
   labs(title = "Suicidality events overlaid on daily state sequences",
        subtitle = "Circle = any SI; triangle = self-harm; cross = suicide attempt",
        x = "Study day", y = NULL) +
-  theme_hw() + theme(axis.text.y = element_text(size = 6))
+  theme_hw() + theme(axis.text.y = element_text(size = 6), legend.text = element_text(size = 8))
 
 ```
 
-```{r state_transition_network, fig.height = 6, warning = FALSE}
+```{r state_transition_network, fig.height = 7, fig.width = 9, warning = FALSE}
 
 ## 3.2c State-transition structure: network + exact-probability heatmap ##
 
 #3.2.3 Transition structure over CONSECUTIVE-day pairs only (row = from, col = to).
 #      Row-normalized => empirical transition probabilities; the diagonal is
-#      state persistence (a slow, "sticky" state has high self-transition).
+#      state persistence
 trans <- seq_df |>
   dplyr::filter(consecutive) |>
   dplyr::count(from = prev_state, to = state) |>
@@ -896,7 +1090,7 @@ trans <- seq_df |>
 #3.2.3a Network layout: lay the K states on a circle. Node SIZE = how often the
 #       state is occupied; node FILL = that state's mean SI, so the high-risk
 #       state is visually obvious; directed curved EDGES = between-state
-#       transition probability (self-transitions annotated separately below).
+#       transition probability
 si_metric_net <- if ("si_bother" %in% names(model_df)) "si_bother" else cfg$overlay$primary[1]
 state_i_all <- as.integer(as.character(model_df$state))
 ang <- (seq_len(best$K) - 1) / best$K * 2 * pi + pi / 2     # start at top
@@ -909,11 +1103,11 @@ nodes <- tibble::tibble(
 
 #3.2.3b Off-diagonal edges only (between-state moves); drop near-zero edges so the
 #       graph isn't a hairball. A perpendicular midpoint offset bends each edge so
-#       opposing arrows (i->j vs j->i) don't overlap.
+#       opposing arrows (i->j vs j->i) don't overlap
 edges <- trans |>
   dplyr::filter(from != to, prob > 0.02) |>
   dplyr::left_join(dplyr::rename(nodes, from = state, x0 = x, y0 = y), by = "from") |>
-  dplyr::left_join(dplyr::rename(nodes, to   = state, x1 = x, y1 = y), by = "to") |>
+  dplyr::left_join(dplyr::rename(nodes, to = state, x1 = x, y1 = y), by = "to") |>
   dplyr::mutate(
     mx = (x0 + x1) / 2, my = (y0 + y1) / 2,
     nx = -(y1 - y0), ny = (x1 - x0), len = sqrt(nx^2 + ny^2),
@@ -927,6 +1121,7 @@ bez <- function(p0, p1, p2, n = 30) {
   t <- seq(0, 1, length.out = n)
   (1 - t)^2 * p0 + 2 * (1 - t) * t * p1 + t^2 * p2
 }
+
 edge_paths <- if (nrow(edges) > 0) do.call(rbind, lapply(seq_len(nrow(edges)), function(i) {
   e <- edges[i, ]
   data.frame(id = i, prob = e$prob,
@@ -948,6 +1143,7 @@ self_p <- trans |> dplyr::filter(from == to) |>
   dplyr::right_join(nodes, by = "state")
 
 net <- ggplot()
+
 if (!is.null(edge_paths)) {
   net <- net +
     geom_path(data = edge_paths,
@@ -958,6 +1154,7 @@ if (!is.null(edge_paths)) {
                  arrow = grid::arrow(length = grid::unit(0.16, "cm"), type = "closed"),
                  colour = "grey35", linewidth = 0.4, show.legend = FALSE)
 }
+
 net +
   geom_point(data = nodes, aes(x, y, size = occupancy, fill = si),
              shape = 21, colour = "grey20", stroke = 0.8) +
@@ -977,7 +1174,7 @@ net +
         legend.position = "right")
 
 #3.2.3e Companion heatmap: exact probabilities incl. the diagonal the network
-#       abstracts. Network = structure at a glance; heatmap = precise values.
+#       abstracts. Network = structure at a glance; heatmap = precise values
 ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
   geom_tile(colour = "white", linewidth = 0.6) +
   geom_text(aes(label = ifelse(n == 0, "", sprintf("%.2f", prob))), size = 3) +
@@ -995,7 +1192,7 @@ ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
 
 #3.2.4 Dwell times: lengths of maximal runs of the SAME state across consecutive
 #      days (a run is broken by a state change OR a day gap), i.e. how long the
-#      system typically sits in a state before moving.
+#      system typically sits in a state before moving
 new_run <- !(seq_df$consecutive & seq_df$state == seq_df$prev_state)
 new_run[is.na(new_run)] <- TRUE
 seq_df$run <- cumsum(new_run)
@@ -1014,34 +1211,32 @@ nice_tbl(dwell, caption = "Dwell time per state (lengths of consecutive-day runs
 
 ### How to read the critical-slowing-down (CSD) analysis
 
-The theory (Scheffer): a system nearing a tipping point loses resilience -- after
-any small perturbation it drifts back to baseline more *slowly*. In daily data
+The theory (Scheffer): a system nearing a tipping point loses resilience, and after
+any small perturbation it drifts back to baseline more slowly. In daily data
 that loss of resilience leaves two statistical fingerprints in the days just
-before a transition: (1) **rising variance** (the system wanders further before
-recovering) and (2) **rising lag-1 autocorrelation** (today looks more like
-yesterday, because recovery is sluggish). The analysis below therefore takes
+before a transition: (1) rising variance, where the system wanders further before
+recovering, and (2) rising lag-1 autocorrelation, where today looks more like
+yesterday, because recovery is sluggish. The analysis below therefore takes
 every stretch of consecutive days, computes those two fingerprints per feature
 inside a short trailing window, and asks one question: *are the windows that
 immediately precede a within-person SI surge different from all the other
 windows?* In the boxplot, each facet column is a feature, the top row is the
 autocorrelation fingerprint and the bottom row the variance fingerprint, and
 within each panel the two boxes compare "pre-surge" windows against "other"
-windows. CSD predicts the pre-surge box sits **higher** in *both* rows. With few
-pre-surge windows this is direction-reading only -- preliminary evidence for the
-F31, not a test.
+windows. CSD predicts the pre-surge box sits higher in both rows. With few
+pre-surge windows this is direction-reading only
 
 ```{r early_warning, fig.height = 5, warning = FALSE}
 
 ## 3.3 Stage 3b (EXPLORATORY): critical-slowing-down before high-SI onset ##
 
 # WHAT THIS ASKS: dynamical-systems theory (Scheffer) predicts that as a system
-# approaches a tipping point, it recovers more slowly from perturbations -- which
+# approaches a tipping point, it recovers more slowly from perturbations; which
 # shows up as RISING variance and RISING lag-1 autocorrelation (AC1) in the days
 # just before the transition. Here the "transition" is a within-person surge in
 # suicidal ideation. If CSD operates at the daily timescale, the short window of
 # days immediately BEFORE an SI surge should show higher variance / AC1 in the
-# mood+sleep features than ordinary windows. This is the core F31 hypothesis,
-# tested here only as a feasibility probe.
+# mood+sleep features than ordinary windows
 
 si_metric <- if ("si_bother" %in% names(model_df)) "si_bother" else cfg$overlay$primary[1]
 ew_window <- 3L   # trailing consecutive-day window (kept short; series are brief/gappy)
@@ -1050,7 +1245,7 @@ ew_window <- 3L   # trailing consecutive-day window (kept short; series are brie
 #      entry. Categorical entry into the high-SI state is too rare in these short,
 #      gappy series to yield usable windows; a within-person rise in the
 #      continuous SI score past that person's own median (from below it) captures
-#      the same "crossing into a high-SI day" idea with far more events.
+#      the same "crossing into a high-SI day" idea with far more events
 si_by_person <- model_df |>
   dplyr::mutate(state_i = as.integer(as.character(state))) |>
   dplyr::group_by(subject) |>
@@ -1064,7 +1259,7 @@ seq_si <- seq_df |>
 #3.3.2 Slide a window of `ew_window` CONSECUTIVE days within each subject; compute
 #      each feature's variance and AC1 in the window, then flag whether the day
 #      immediately AFTER is an SI surge (at/above the person's median, having been
-#      below it on the window's last day).
+#      below it on the window's last day)
 ac1 <- function(x) {
   if (length(x) < 3L || stats::sd(x) == 0) return(NA_real_)
   stats::cor(x[-length(x)], x[-1])
@@ -1077,8 +1272,10 @@ for (sdf in split(seq_si, seq_si$subject)) {
   for (i in seq_len(nrow(sdf) - ew_window)) {
     win <- sdf[i:(i + ew_window - 1L), ]
     nxt <- sdf[i + ew_window, ]
+    
     #3.3.2.1 window fully consecutive AND nxt adjacent to its last day
     if (any(diff(win$day) != 1L) || (nxt$day - win$day[ew_window]) != 1L) next
+    
     #3.3.2.2 need SI present on the boundary days to define a surge
     last_si <- win$si_now[ew_window]
     if (is.na(last_si) || is.na(nxt$si_now) || is.na(nxt$si_thresh)) next
@@ -1096,8 +1293,7 @@ for (sdf in split(seq_si, seq_si$subject)) {
 ew <- if (length(ew_rows)) do.call(rbind, ew_rows) else NULL
 
 #3.3.3 FEASIBILITY FIRST: report how many windows and how many pre-onset windows
-#      exist. This count -- not any p-value -- is the headline; if pre-onset
-#      windows are in the single digits, the boxplots are illustrative only.
+#      exist. This count determines if pre-onset windows are in the single digits
 message(glue::glue(
   "Early-warning feasibility: {n_windows} valid {ew_window}-day windows, ",
   "of which {n_onset} precede a within-person SI surge ",
@@ -1105,8 +1301,9 @@ message(glue::glue(
 
 #3.3.4 Compare indicator levels in pre-surge vs other windows. Strictly
 #      hypothesis-generating: read DIRECTION (are pre-surge variance/AC1 higher?)
-#      and the pre-surge n, never significance.
+#      and the pre-surge n
 ew_ok <- !is.null(ew) && n_onset >= 3L
+
 if (ew_ok) {
   ew_long <- ew |>
     tidyr::pivot_longer(c(variance, ac1), names_to = "indicator", values_to = "value") |>
@@ -1115,6 +1312,7 @@ if (ew_ok) {
                   indicator = dplyr::recode(indicator,
                     variance = "variance (within-window spread)",
                     ac1 = "lag-1 autocorrelation (recovery slowing)"))
+  
 } else {
   message("Too few pre-surge windows (", n_onset,
           ") for a meaningful comparison; reporting feasibility only. ",
@@ -1124,8 +1322,7 @@ if (ew_ok) {
 
 #3.3.5 Table + plot are emitted as TOP-LEVEL single-expression conditionals:
 #      values created inside a multi-expression `{}` block are invisible to
-#      knitr's auto-printing (the summary table silently vanished from an
-#      earlier knit for exactly this reason).
+#      knitr's auto-printing
 if (ew_ok) nice_tbl(
   ew_long |>
     dplyr::group_by(feature, indicator, window) |>
@@ -1158,24 +1355,19 @@ if (ew_ok) ggplot(ew_long, aes(window, value, fill = window)) +
     (entropy-penalized) and the smallest-mixing-weight diagnostic
     alongside BIC, the person x state artifact check, and the
     person-mean-centered sensitivity refit (Section 2.8) isolating
-    within-person state structure.
+    within-person state structure
 -   Commission-error rate is excluded from the mixture (documented
-    above: \~45% zero-error days force degenerate components) and
-    reported as an overlay only.
+    above: \~45% zero-error days force degenerate components)
 -   The daily EMA mood items are depression and anxiety only, there is
     no daily elevated-mood/manic item, so states characterize the
     depressive/dysregulated axis, with the manic pole captured only
-    indirectly (e.g., via sleep loss).
+    indirectly (e.g., via sleep loss)
 -   Actigraphy was processed with the Sadeh algorithm for most but not
-    all participants; the algorithm is a one-line config swap for a
-    Cole-Kripke sensitivity analysis.
--   If the criteria prefer K = 1 or states reduce to person identity,
-    that is itself a reportable finding about the (lack of) shared
-    multivariate state structure.
+    all participants
 -   The Stage-3b early-warning (critical-slowing-down) analysis is
-    exploratory and underpowered: short, gap-interrupted per-person
+    exploratory and underpowered. Short, gap-interrupted per-person
     series yield few consecutive pre-onset windows, so it is reported as
     hypothesis-generating preliminary evidence for the F31, not a
     confirmatory test of rising variance / autocorrelation before
-    high-SI transitions.
+    high-SI transitions
 

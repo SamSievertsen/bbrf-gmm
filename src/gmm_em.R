@@ -6,7 +6,7 @@
 #
 # Purpose:
 #   Implement GMM/EM entirely from first principles (no mclust / mixtools /
-#   flexmix etc.), as required by the ML course final project. We create the
+#   flexmix etc.), as required by BMI 643 final project. We create the
 #   Gaussian log-density, the E-step responsibilities, the M-step parameter
 #   updates, the observed-data log-likelihood, model selection via BIC/AIC/ICL,
 #   and multi-restart initialization. Only base R + the `stats` linear-algebra
@@ -291,7 +291,7 @@ gmm_em_fit_1d <- function(x, K, n_restarts = 20L, max_iter = 500L,
 #    when components overlap. Adding 2*EN to BIC yields the Integrated Completed
 #    Likelihood (ICL), which penalizes fuzzy/overlapping solutions and so resists
 #    the over-splitting that BIC exhibits when a mixture is used as a flexible
-#    density estimator rather than to recover distinct subgroups.
+#    density estimator rather than to recover distinct subgroups
 classification_entropy <- function(resp) {
   r <- resp[resp > 0]
   -sum(r * log(r))
@@ -393,7 +393,7 @@ gmm_person_state_check <- function(fit, person_id) {
 #    of a multivariate Gaussian on feature j is N(mu_j, Sigma_jj); de-standardize
 #    each component's j-th mean/sd via the center/scale attributes that
 #    zscore_matrix() stored on X, then sum the component densities weighted by the
-#    mixing coefficients over a grid spanning the observed data.
+#    mixing coefficients over a grid spanning the observed data
 gmm_marginal_density <- function(fit, X, feature, n_grid = 256L) {
   j <- which(colnames(X) == feature)
   
@@ -416,8 +416,7 @@ gmm_marginal_density <- function(fit, X, feature, n_grid = 256L) {
 
 #6.2 Per-COMPONENT marginal densities for one feature, native units. Same as
 #     gmm_marginal_density() but keeps each component separate (and scaled by its
-#     mixing weight) so every state is its own labeled curve -- this is what makes
-#     "which bump is which state" legible.
+#     mixing weight) so every state is its own labeled curve
 gmm_component_density <- function(fit, X, feature, n_grid = 256L) {
   j <- which(colnames(X) == feature)
   if (length(j) != 1L) stop("feature '", feature, "' not found in colnames(X).")
@@ -435,7 +434,7 @@ gmm_component_density <- function(fit, X, feature, n_grid = 256L) {
 #    regular grid (for contouring). The 2-D marginal of each component is the
 #    bivariate Gaussian with that component's 2-mean and 2x2 sub-covariance;
 #    we evaluate it in standardized space (where the fit lives) and label the
-#    grid in native units.
+#    grid in native units
 gmm_bivariate_grid <- function(fit, X, fx, fy, n_grid = 80L) {
   jx <- which(colnames(X) == fx); jy <- which(colnames(X) == fy)
   
@@ -462,14 +461,12 @@ gmm_bivariate_grid <- function(fit, X, fx, fy, n_grid = 80L) {
   tibble::tibble(x = grid$x, y = grid$y, density = dens)
 }
 
-## 7. Verification & density-adequacy helpers (from scratch) ##
+## 7. Verification & density-adequacy helper functions ##
 
 #7.1 Mixture log-likelihood of NEW data under a fitted GMM. This is the E-step
 #    density computation re-used for held-out rows: per row, log sum_k
 #    [w_k * N(x | mu_k, Sigma_k)] via log-sum-exp. The sum over rows is the
-#    out-of-sample log-likelihood -- the penalty-free, cross-validatable measure
-#    of density-estimation quality (unlike BIC, it makes no independence-based
-#    effective-N assumption about the TRAINING data it never saw).
+#    out-of-sample log-likelihood
 gmm_loglik <- function(fit, Xnew) {
   Xnew <- as.matrix(Xnew)
   n <- nrow(Xnew)
