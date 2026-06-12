@@ -531,6 +531,228 @@ nice_tbl(
 
 ```
 
+## 2.9 EM verification & density-estimation adequacy
+
+The mixture is hand-implemented, so before any scientific claim we verify the
+*algorithm* and the *density estimate* separately. Four checks, each targeting a
+distinct failure mode:
+
+1. **EM monotonicity** -- EM provably never decreases the observed-data
+   log-likelihood; a single decrease in the iteration trace means the
+   implementation is wrong. This is the sharpest single correctness test
+   available without a reference library.
+2. **Restart stability** -- EM only finds local optima. If the 30 restarts
+   scatter across many distinct log-likelihood values, the reported solution is
+   initialization luck; if most restarts reach the same best mode, the optimum
+   is reliable.
+3. **Posterior predictive check (PPC)** -- a good *density estimate* must be
+   able to regenerate the data. We simulate person-days from the fitted mixture
+   and compare simulated vs observed marginals and the full correlation
+   structure (the joint dependence is what a multivariate GMM buys over per-
+   feature fits). PIT values (the fitted marginal CDF evaluated at each
+   observation) should be approximately Uniform(0,1) if the marginals fit.
+4. **Person-blocked cross-validated log-likelihood** -- the direct, assumption-
+   free answer to "BIC's penalty assumes independent rows." Held-out density
+   (fit on most people, score the held-out people's days) makes no effective-N
+   assumption: if K = 4 generalizes to unseen *people*, its held-out
+   log-likelihood should be competitive, and overfit K should drop.
+
+```{r em_verification, fig.height = 4, warning = FALSE}
+
+## 2.9.1 EM correctness: monotone log-likelihood + restart stability ##
+
+#2.9.1.1 Monotonicity audit on the chosen fit's iteration trace. Tolerance 1e-8
+#        absorbs floating-point noise only; any real decrease fails loudly.
+ll_tr <- best$log_lik_trace
+mono_viol <- sum(diff(ll_tr) < -1e-8)
+message(glue::glue(
+  "EM monotonicity: {length(ll_tr)} iterations, {mono_viol} decreases ",
+  "(must be 0); total log-lik climb = {round(ll_tr[length(ll_tr)] - ll_tr[1], 1)}."))
+
+ggplot(data.frame(iter = seq_along(ll_tr), loglik = ll_tr), aes(iter, loglik)) +
+  geom_line(colour = "#21908C", linewidth = 0.7) +
+  labs(title = glue::glue("EM convergence trace (K = {best$K})"),
+       subtitle = "Monotone non-decreasing by construction; any dip = implementation bug",
+       x = "EM iteration", y = "Observed-data log-likelihood") +
+  theme_hw()
+
+#2.9.1.2 Restart stability: final log-lik of every restart at the chosen K.
+#        "Modal share" = fraction of restarts landing within 1e-3 of the best.
+rl <- best$restart_loglik[is.finite(best$restart_loglik)]
+modal_share <- mean(rl > max(rl) - 1e-3)
+message(glue::glue(
+  "Restart stability: {length(rl)} restarts, {round(100 * modal_share, 1)}% ",
+  "reached the best mode (spread = {round(max(rl) - min(rl), 1)} log-lik units)."))
+
+ggplot(data.frame(loglik = rl), aes(x = loglik, y = "")) +
+  geom_jitter(height = 0.15, size = 2, alpha = 0.6, colour = "grey40") +
+  geom_point(aes(x = max(rl), y = ""), colour = "#21908C", size = 3.5) +
+  labs(title = glue::glue("Final log-likelihood across {length(rl)} restarts (K = {best$K})"),
+       subtitle = "Teal = retained solution; tight clustering = reliable optimum",
+       x = "Final log-likelihood", y = NULL) +
+  theme_hw()
+
+```
+
+```{r density_ppc, fig.height = 6, warning = FALSE}
+
+## 2.9.2 Posterior predictive check: can the fitted mixture regenerate the data? ##
+
+#2.9.2.1 Simulate as many person-days as observed, de-standardize to native units
+sim <- gmm_simulate(best, n = nrow(X), seed = cfg$gmm$seed)
+sim_native <- sweep(sweep(sim$X, 2L, attr(X, "scale"), "*"), 2L, attr(X, "center"), "+")
+
+ppc_long <- dplyr::bind_rows(
+  model_df |> dplyr::select(dplyr::all_of(colnames(X))) |>
+    tidyr::pivot_longer(dplyr::everything(), names_to = "feature", values_to = "value") |>
+    dplyr::mutate(source = "observed"),
+  tibble::as_tibble(sim_native) |>
+    tidyr::pivot_longer(dplyr::everything(), names_to = "feature", values_to = "value") |>
+    dplyr::mutate(source = "simulated"))
+
+#2.9.2.2 Overlay: simulated density should trace the observed histogram. Misfit
+#        shows as systematic gaps (e.g., unmodeled skew or floors).
+ggplot() +
+  geom_histogram(data = dplyr::filter(ppc_long, source == "observed"),
+                 aes(value, y = ggplot2::after_stat(density)),
+                 bins = 30, fill = "grey85", colour = "white", linewidth = 0.2) +
+  geom_density(data = dplyr::filter(ppc_long, source == "simulated"),
+               aes(value), colour = "#21908C", linewidth = 0.8) +
+  facet_wrap(~ feature, scales = "free", ncol = 2) +
+  labs(title = glue::glue("Posterior predictive check (K = {best$K})"),
+       subtitle = "Grey = observed person-days; teal = density of mixture-simulated person-days",
+       x = NULL, y = "Density") +
+  theme_hw()
+
+#2.9.2.3 Joint structure: the simulated CORRELATION matrix must match the
+#        observed one (this is what the full covariance components buy). Report
+#        the worst absolute discrepancy across all feature pairs.
+cor_obs <- stats::cor(X)
+cor_sim <- stats::cor(sim$X)
+cor_diff <- cor_sim - cor_obs
+message(glue::glue(
+  "PPC correlation recovery: max |simulated - observed| correlation = ",
+  "{round(max(abs(cor_diff[upper.tri(cor_diff)])), 3)} across ",
+  "{sum(upper.tri(cor_diff))} feature pairs."))
+
+cor_long <- dplyr::bind_rows(
+  tibble::as_tibble(cor_obs, rownames = "f1") |>
+    tidyr::pivot_longer(-f1, names_to = "f2", values_to = "r") |>
+    dplyr::mutate(source = "observed"),
+  tibble::as_tibble(cor_sim, rownames = "f1") |>
+    tidyr::pivot_longer(-f1, names_to = "f2", values_to = "r") |>
+    dplyr::mutate(source = "simulated"))
+
+ggplot(cor_long, aes(f2, f1, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%+.2f", r)), size = 2.6) +
+  facet_wrap(~ source) +
+  scale_fill_gradient2(low = "#3B528B", mid = "grey95", high = "#B8003E",
+                       midpoint = 0, limits = c(-1, 1), name = "r") +
+  labs(title = "Joint-structure recovery: observed vs simulated correlations",
+       subtitle = "A faithful mixture reproduces the dependence structure, not just the marginals",
+       x = NULL, y = NULL) +
+  theme_hw() + theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+                     axis.text.y = element_text(size = 7))
+
+```
+
+```{r density_pit, fig.height = 3.8, warning = FALSE}
+
+## 2.9.3 PIT: probability integral transform of each marginal ##
+
+#2.9.3.1 For feature j, the fitted marginal CDF is sum_k w_k * pnorm(x; mu_kj,
+#        sd_kj) (computed in z-space, where the fit lives). If the marginal
+#        density is right, the CDF evaluated at the data is ~ Uniform(0, 1):
+#        flat PIT histogram. Humps/edge spikes localize misfit.
+pit_long <- purrr::map_dfr(seq_len(ncol(X)), function(j) {
+  pit <- rowSums(vapply(seq_len(best$K), function(k)
+    best$weights[k] * stats::pnorm(X[, j], best$mu[k, j],
+                                   sqrt(best$Sigma[[k]][j, j])),
+    numeric(nrow(X))))
+  ks <- suppressWarnings(stats::ks.test(pit, "punif")$statistic)
+  tibble::tibble(feature = colnames(X)[j], pit = pit, ks = round(ks, 3))
+})
+
+nice_tbl(dplyr::distinct(pit_long, feature, ks) |> dplyr::arrange(ks),
+         caption = "PIT uniformity per feature (KS distance from Uniform(0,1); smaller = better marginal fit)")
+
+ggplot(pit_long, aes(pit)) +
+  geom_histogram(breaks = seq(0, 1, by = 0.1), fill = "#21908C",
+                 colour = "white", linewidth = 0.2) +
+  geom_hline(yintercept = nrow(X) / 10, linetype = 2, colour = "grey50") +
+  facet_wrap(~ feature, ncol = 3) +
+  labs(title = "PIT histograms (fitted marginal CDF at each observation)",
+       subtitle = "Dashed = perfect-uniform reference; flat bars = well-calibrated marginal density",
+       x = "PIT value", y = "Person-days") +
+  theme_hw()
+
+```
+
+```{r cv_heldout_loglik, fig.height = 4, warning = FALSE}
+
+## 2.9.4 Person-blocked cross-validated log-likelihood across K ##
+
+#2.9.4.1 5 folds of SUBJECTS (never split a person across train/test), so the
+#        score asks: does the K-state density generalize to unseen PEOPLE? This
+#        is the independence-assumption-free counterpart to BIC. Standardization
+#        is re-estimated within each training fold and projected onto the test
+#        fold (no leakage).
+set.seed(cfg$gmm$seed)
+subj_all <- unique(person_id)
+folds <- split(sample(subj_all), rep_len(1:5, length(subj_all)))
+k_cv <- 1:6
+n_restarts_cv <- 10L   # fewer restarts per fold to bound runtime; stability ok per 2.9.1
+
+M_raw <- as.matrix(model_df[, feat_model])
+cv_rows <- list(); i <- 0L
+for (K in k_cv) {
+  for (f in seq_along(folds)) {
+    te_idx <- person_id %in% folds[[f]]
+    Ztr <- zscore_matrix(M_raw[!te_idx, , drop = FALSE])
+    Zte <- sweep(sweep(M_raw[te_idx, , drop = FALSE], 2L, attr(Ztr, "center"), "-"),
+                 2L, attr(Ztr, "scale"), "/")
+    fit_f <- gmm_em_fit(Ztr, K, n_restarts = n_restarts_cv,
+                        max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol,
+                        ridge = cfg$gmm$ridge, seed = cfg$gmm$seed + 100L * K + f)
+    i <- i + 1L
+    cv_rows[[i]] <- data.frame(K = K, fold = f, n_test = sum(te_idx),
+                               ll = gmm_loglik(fit_f, Zte))
+  }
+}
+
+#2.9.4.2 Mean held-out log-likelihood PER PERSON-DAY (comparable across folds of
+#        different sizes), with across-fold SE
+cv <- do.call(rbind, cv_rows) |>
+  dplyr::mutate(ll_per_day = ll / n_test) |>
+  dplyr::group_by(K) |>
+  dplyr::summarise(mean_ll = mean(ll_per_day),
+                   se_ll = stats::sd(ll_per_day) / sqrt(dplyr::n()),
+                   .groups = "drop")
+
+k_cv_best <- cv$K[which.max(cv$mean_ll)]
+message(glue::glue(
+  "Person-blocked CV: held-out log-lik/day peaks at K = {k_cv_best} ",
+  "(chosen K = {chosen_k})."))
+
+nice_tbl(cv, digits = 3,
+         caption = "Held-out log-likelihood per person-day by K (5-fold, person-blocked)")
+
+ggplot(cv, aes(K, mean_ll)) +
+  geom_line(colour = "grey70", linewidth = 0.6) +
+  geom_errorbar(aes(ymin = mean_ll - se_ll, ymax = mean_ll + se_ll),
+                width = 0.12, colour = "grey55") +
+  geom_point(size = 2.4, colour = "grey45") +
+  geom_point(data = dplyr::filter(cv, K == chosen_k), size = 4, colour = "#21908C") +
+  scale_x_continuous(breaks = k_cv) +
+  labs(title = "Person-blocked cross-validated density fit",
+       subtitle = glue::glue("Higher is better; teal = chosen K = {chosen_k}; ",
+                             "no independence assumption (unlike BIC)"),
+       x = "Number of states (K)", y = "Held-out log-lik / person-day") +
+  theme_hw()
+
+```
+
 ## 3. State characterization, SI overlay, and dynamics
 
 ```{r state_overlay, warning = FALSE}
@@ -596,56 +818,63 @@ nice_tbl(conf_df,
 
 ```
 
-```{r state_si_overlay_raster, fig.height = 8, warning = FALSE}
+```{r state_si_overlay_raster, fig.height = 6.5, warning = FALSE}
 
-## 3.2b SI overlaid on the per-person state raster (one panel per SI metric) ##
+## 3.2b SI overlaid on the per-person state raster ##
 
-#3.2b.1 Choose the suicidality outcomes to overlay. Continuous metrics
-#       (si_bother, si_severity) drive point size/alpha; binary/count metrics
-#       (si_any, SELFHARM, SUICIDEATTEMPT, ACTIVESIWITHINTENT) are shown as a
-#       mark only on the days where the event is present. We split them so each
-#       is encoded honestly rather than forcing one scale onto both.
-si_continuous <- intersect(c("si_bother", "si_severity"), names(seq_df))
-si_binary     <- intersect(c("si_any", "ACTIVESIWITHINTENT", "SELFHARM", "SUICIDEATTEMPT"),
-                           names(seq_df))
+#3.2b.1 Two separate figures so neither encoding is squeezed: (A) the primary
+#       CONTINUOUS metric (si_bother) as a size/opacity dot overlay; (B) the
+#       BINARY events on one panel, distinguished by SHAPE. Deliberately omitted:
+#       si_severity (near-collinear with si_bother -- same construct, coarser
+#       scale) and ACTIVESIWITHINTENT (~constant near 1 across all states in the
+#       overlay table, so it carries no discriminating signal here).
+si_cont_metric <- "si_bother"
+si_event_vars  <- intersect(c("si_any", "SELFHARM", "SUICIDEATTEMPT"), names(seq_df))
 
-#3.2b.2 Long format: one row per (subject, day, metric). The tile still encodes
-#       STATE (the latent assignment); the overlay encodes the SI OUTCOME, so the
-#       plot answers "where do high-SI days fall across the state sequences?"
-si_long <- seq_df |>
-  dplyr::select(subject, day, state, dplyr::all_of(c(si_continuous, si_binary))) |>
-  tidyr::pivot_longer(dplyr::all_of(c(si_continuous, si_binary)),
-                      names_to = "si_metric", values_to = "si_value") |>
-  dplyr::mutate(
-    kind = ifelse(si_metric %in% si_continuous, "continuous", "binary"),
-    #3.2b.2.1 binary "present" = any non-zero/TRUE; continuous keeps its value
-    present = dplyr::case_when(
-      kind == "binary" ~ si_value > 0,
-      TRUE ~ !is.na(si_value)),
-    si_metric = factor(si_metric, levels = c(si_continuous, si_binary)))
-
-#3.2b.3 Base raster (state = fill) with the SI overlay drawn on top. For
-#       continuous metrics, a filled circle whose SIZE and OPACITY scale with the
-#       value; for binary metrics, a hollow diamond only on present-days. State
-#       fill is deliberately desaturated (alpha) so the black overlay reads.
-ggplot(si_long, aes(day, factor(subject))) +
-  geom_tile(aes(fill = factor(state)), colour = "grey95", linewidth = 0.15, alpha = 0.55) +
-  #3.2b.3.1 continuous SI: size + alpha encode magnitude
-  geom_point(data = dplyr::filter(si_long, kind == "continuous", present),
-             aes(size = si_value, alpha = si_value), shape = 16, colour = "grey10") +
-  #3.2b.3.2 binary/count SI: a single mark on present-days (size fixed)
-  geom_point(data = dplyr::filter(si_long, kind == "binary", present),
-             shape = 5, size = 1.5, stroke = 0.6, colour = "grey10") +
-  facet_wrap(~ si_metric, ncol = 1) +
+#3.2b.2 FIGURE A: state raster + continuous SI dots. Tile = MAP state
+#       (desaturated so the overlay reads); dot size AND opacity scale with the
+#       day's si_bother, so high-SI days pop and zero-SI days vanish.
+ggplot(seq_df, aes(day, factor(subject))) +
+  geom_tile(aes(fill = factor(state)), colour = "grey95",
+            linewidth = 0.15, alpha = 0.55) +
+  geom_point(data = dplyr::filter(seq_df, !is.na(.data[[si_cont_metric]]),
+                                  .data[[si_cont_metric]] > 0),
+             aes(size = .data[[si_cont_metric]], alpha = .data[[si_cont_metric]]),
+             shape = 16, colour = "grey10") +
   scale_fill_viridis_d(end = 0.9, name = "State") +
-  scale_size_continuous(range = c(0.4, 3.2), name = "SI value") +
+  scale_size_continuous(range = c(0.5, 3.4), name = si_cont_metric) +
   scale_alpha_continuous(range = c(0.25, 0.95), guide = "none") +
-  labs(title = "Suicidality overlaid on per-person daily state sequences",
-       subtitle = paste("Tile = MAP state; filled dot size/opacity = continuous SI;",
-                        "hollow diamond = binary/count SI event"),
+  labs(title = "Continuous SI overlaid on daily state sequences",
+       subtitle = glue::glue("Tile = MAP state; dot size/opacity = {si_cont_metric} (0 days unmarked)"),
        x = "Study day", y = NULL) +
-  theme_hw() + theme(axis.text.y = element_text(size = 5),
-                     panel.spacing = grid::unit(0.6, "lines"))
+  theme_hw() + theme(axis.text.y = element_text(size = 6))
+
+```
+
+```{r state_si_events_raster, fig.height = 6.5, warning = FALSE}
+
+#3.2b.3 FIGURE B: binary suicidality EVENTS on the same raster, one panel,
+#       distinguished by shape (legend). Plotted rarest-last so attempts/self-
+#       harm sit on top of the (frequent) si_any marks.
+events_long <- seq_df |>
+  dplyr::select(subject, day, state, dplyr::all_of(si_event_vars)) |>
+  tidyr::pivot_longer(dplyr::all_of(si_event_vars),
+                      names_to = "event", values_to = "v") |>
+  dplyr::filter(!is.na(v), v > 0) |>
+  dplyr::mutate(event = factor(event, levels = c("si_any", "SELFHARM", "SUICIDEATTEMPT")))
+
+ggplot(seq_df, aes(day, factor(subject))) +
+  geom_tile(aes(fill = factor(state)), colour = "grey95",
+            linewidth = 0.15, alpha = 0.55) +
+  geom_point(data = events_long, aes(shape = event), size = 1.7,
+             stroke = 0.7, colour = "grey10") +
+  scale_fill_viridis_d(end = 0.9, name = "State") +
+  scale_shape_manual(values = c(si_any = 1, SELFHARM = 17, SUICIDEATTEMPT = 4),
+                     name = "Event", drop = FALSE) +
+  labs(title = "Suicidality events overlaid on daily state sequences",
+       subtitle = "Circle = any SI; triangle = self-harm; cross = suicide attempt",
+       x = "Study day", y = NULL) +
+  theme_hw() + theme(axis.text.y = element_text(size = 6))
 
 ```
 
@@ -783,6 +1012,24 @@ nice_tbl(dwell, caption = "Dwell time per state (lengths of consecutive-day runs
 
 ```
 
+### How to read the critical-slowing-down (CSD) analysis
+
+The theory (Scheffer): a system nearing a tipping point loses resilience -- after
+any small perturbation it drifts back to baseline more *slowly*. In daily data
+that loss of resilience leaves two statistical fingerprints in the days just
+before a transition: (1) **rising variance** (the system wanders further before
+recovering) and (2) **rising lag-1 autocorrelation** (today looks more like
+yesterday, because recovery is sluggish). The analysis below therefore takes
+every stretch of consecutive days, computes those two fingerprints per feature
+inside a short trailing window, and asks one question: *are the windows that
+immediately precede a within-person SI surge different from all the other
+windows?* In the boxplot, each facet column is a feature, the top row is the
+autocorrelation fingerprint and the bottom row the variance fingerprint, and
+within each panel the two boxes compare "pre-surge" windows against "other"
+windows. CSD predicts the pre-surge box sits **higher** in *both* rows. With few
+pre-surge windows this is direction-reading only -- preliminary evidence for the
+F31, not a test.
+
 ```{r early_warning, fig.height = 5, warning = FALSE}
 
 ## 3.3 Stage 3b (EXPLORATORY): critical-slowing-down before high-SI onset ##
@@ -856,10 +1103,11 @@ message(glue::glue(
   "of which {n_onset} precede a within-person SI surge ",
   "(SI metric = {si_metric})."))
 
-#3.3.4 Compare indicator levels in pre-onset vs other windows. Strictly
-#      hypothesis-generating: read DIRECTION (are pre-onset variance/AC1 higher?)
-#      and the pre-onset n, never significance.
-if (!is.null(ew) && n_onset >= 3L) {
+#3.3.4 Compare indicator levels in pre-surge vs other windows. Strictly
+#      hypothesis-generating: read DIRECTION (are pre-surge variance/AC1 higher?)
+#      and the pre-surge n, never significance.
+ew_ok <- !is.null(ew) && n_onset >= 3L
+if (ew_ok) {
   ew_long <- ew |>
     tidyr::pivot_longer(c(variance, ac1), names_to = "indicator", values_to = "value") |>
     tidyr::drop_na(value) |>
@@ -867,33 +1115,37 @@ if (!is.null(ew) && n_onset >= 3L) {
                   indicator = dplyr::recode(indicator,
                     variance = "variance (within-window spread)",
                     ac1 = "lag-1 autocorrelation (recovery slowing)"))
-
-  nice_tbl(
-    ew_long |>
-      dplyr::group_by(feature, indicator, window) |>
-      dplyr::summarise(n = dplyr::n(), mean = mean(value), .groups = "drop"),
-    digits = 3,
-    caption = glue::glue("Early-warning indicators: pre-surge vs other windows ",
-                         "({ew_window}-day windows; {n_onset} pre-surge windows)"))
-
-  ggplot(ew_long, aes(window, value, fill = window)) +
-    geom_boxplot(outlier.size = 0.6, width = 0.6) +
-    geom_jitter(width = 0.12, size = 0.5, alpha = 0.3) +
-    facet_grid(indicator ~ feature, scales = "free_y", switch = "y",
-               labeller = ggplot2::label_wrap_gen(width = 18)) +
-    scale_fill_viridis_d(end = 0.7, guide = "none") +
-    labs(title = "Critical-slowing-down indicators before a within-person SI surge",
-         subtitle = glue::glue("Exploratory; {ew_window}-day windows; ",
-                               "CSD predicts pre-surge > other for BOTH rows"),
-         x = NULL, y = NULL) +
-    theme_hw() +
-    theme(strip.placement = "outside", strip.text.x = element_text(size = 8))
 } else {
   message("Too few pre-surge windows (", n_onset,
           ") for a meaningful comparison; reporting feasibility only. ",
           "This is itself an F31 result: daily sampling is too sparse to resolve ",
           "critical slowing down, motivating denser (e.g. multi-daily) EMA.")
 }
+
+#3.3.5 Table + plot are emitted as TOP-LEVEL single-expression conditionals:
+#      values created inside a multi-expression `{}` block are invisible to
+#      knitr's auto-printing (the summary table silently vanished from an
+#      earlier knit for exactly this reason).
+if (ew_ok) nice_tbl(
+  ew_long |>
+    dplyr::group_by(feature, indicator, window) |>
+    dplyr::summarise(n = dplyr::n(), mean = mean(value), .groups = "drop"),
+  digits = 3,
+  caption = glue::glue("Early-warning indicators: pre-surge vs other windows ",
+                       "({ew_window}-day windows; {n_onset} pre-surge windows)"))
+
+if (ew_ok) ggplot(ew_long, aes(window, value, fill = window)) +
+  geom_boxplot(outlier.size = 0.6, width = 0.6) +
+  geom_jitter(width = 0.12, size = 0.5, alpha = 0.3) +
+  facet_grid(indicator ~ feature, scales = "free_y", switch = "y",
+             labeller = ggplot2::label_wrap_gen(width = 18)) +
+  scale_fill_viridis_d(end = 0.7, guide = "none") +
+  labs(title = "Critical-slowing-down indicators before a within-person SI surge",
+       subtitle = glue::glue("Exploratory; {ew_window}-day windows; ",
+                             "CSD predicts pre-surge > other for BOTH rows"),
+       x = NULL, y = NULL) +
+  theme_hw() +
+  theme(strip.placement = "outside", strip.text.x = element_text(size = 8))
 
 ```
 
@@ -910,8 +1162,8 @@ if (!is.null(ew) && n_onset >= 3L) {
 -   Commission-error rate is excluded from the mixture (documented
     above: \~45% zero-error days force degenerate components) and
     reported as an overlay only.
--   The daily EMA mood items are depression and anxiety only -- there is
-    no daily elevated-mood/manic item -- so states characterize the
+-   The daily EMA mood items are depression and anxiety only, there is
+    no daily elevated-mood/manic item, so states characterize the
     depressive/dysregulated axis, with the manic pole captured only
     indirectly (e.g., via sleep loss).
 -   Actigraphy was processed with the Sadeh algorithm for most but not
@@ -926,3 +1178,4 @@ if (!is.null(ew) && n_onset >= 3L) {
     hypothesis-generating preliminary evidence for the F31, not a
     confirmatory test of rising variance / autocorrelation before
     high-SI transitions.
+

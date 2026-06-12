@@ -126,6 +126,8 @@ gmm_em_fit_once <- function(X, K, max_iter = 500L, tol = 1e-6, ridge = 1e-4) {
   log_lik <- -Inf
   converged <- FALSE
   
+  ll_trace <- numeric(0L)   # per-iteration log-likelihood (EM-correctness audit)
+  
   for (iter in seq_len(max_iter)) {
     
     #2.1.2 E-step: build the n x K matrix of log joint densities, then normalize
@@ -140,6 +142,8 @@ gmm_em_fit_once <- function(X, K, max_iter = 500L, tol = 1e-6, ridge = 1e-4) {
     row_norm <- apply(log_dens, 1L, log_sum_exp)
     resp <- exp(log_dens - row_norm)          # n x K responsibilities
     new_log_lik <- sum(row_norm)
+    
+    ll_trace <- c(ll_trace, new_log_lik)
     
     #2.1.3 Convergence check on the log-likelihood
     if (is.finite(new_log_lik) && abs(new_log_lik - log_lik) < tol) {
@@ -174,6 +178,7 @@ gmm_em_fit_once <- function(X, K, max_iter = 500L, tol = 1e-6, ridge = 1e-4) {
   list(
     K = K, weights = weights, mu = mu, Sigma = Sigma,
     resp = resp, log_lik = log_lik, bic = bic, aic = aic,
+    log_lik_trace = ll_trace,
     n_params = n_params, iterations = iter, converged = converged)
 }
 
@@ -186,6 +191,7 @@ gmm_em_fit <- function(X, K, n_restarts = 20L, max_iter = 500L,
   X <- as.matrix(X)
   
   best <- NULL
+  final_lls <- rep(NA_real_, n_restarts)
   
   for (r in seq_len(n_restarts)) {
     fit <- tryCatch(
@@ -194,6 +200,8 @@ gmm_em_fit <- function(X, K, n_restarts = 20L, max_iter = 500L,
     
     if (is.null(fit)) next
     
+    final_lls[r] <- fit$log_lik
+    
     if (is.null(best) || (is.finite(fit$log_lik) && fit$log_lik > best$log_lik)) {
       best <- fit
     }
@@ -201,6 +209,7 @@ gmm_em_fit <- function(X, K, n_restarts = 20L, max_iter = 500L,
   
   if (is.null(best)) stop("gmm_em_fit(): all restarts failed for K = ", K, ".")
   best$n_restarts <- n_restarts
+  best$restart_loglik <- final_lls
   best
 }
 
@@ -451,4 +460,46 @@ gmm_bivariate_grid <- function(fit, X, fx, fy, n_grid = 80L) {
   }
   
   tibble::tibble(x = grid$x, y = grid$y, density = dens)
+}
+
+## 7. Verification & density-adequacy helpers (from scratch) ##
+
+#7.1 Mixture log-likelihood of NEW data under a fitted GMM. This is the E-step
+#    density computation re-used for held-out rows: per row, log sum_k
+#    [w_k * N(x | mu_k, Sigma_k)] via log-sum-exp. The sum over rows is the
+#    out-of-sample log-likelihood -- the penalty-free, cross-validatable measure
+#    of density-estimation quality (unlike BIC, it makes no independence-based
+#    effective-N assumption about the TRAINING data it never saw).
+gmm_loglik <- function(fit, Xnew) {
+  Xnew <- as.matrix(Xnew)
+  n <- nrow(Xnew)
+  log_dens <- matrix(NA_real_, nrow = n, ncol = fit$K)
+  for (k in seq_len(fit$K)) {
+    log_dens[, k] <- log(fit$weights[k]) +
+      dmvnorm_log(Xnew, fit$mu[k, ], fit$Sigma[[k]])
+  }
+  sum(apply(log_dens, 1L, log_sum_exp))
+}
+
+#7.2 Simulate n draws from a fitted GMM (posterior predictive sampler).
+#    Two-step generative process, implemented from scratch: (1) draw each row's
+#    component from Multinomial(weights); (2) draw x = mu_k + z %*% U_k where
+#    U_k = chol(Sigma_k) is upper-triangular with U'U = Sigma, so
+#    cov(z %*% U) = U' I U = Sigma exactly. Returns draws in the (standardized)
+#    space the model was fit in; the caller de-standardizes via the center/scale
+#    attributes stored by zscore_matrix()
+gmm_simulate <- function(fit, n, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  d <- ncol(fit$mu)
+  comp <- sample.int(fit$K, n, replace = TRUE, prob = fit$weights)
+  out <- matrix(NA_real_, nrow = n, ncol = d)
+  for (k in seq_len(fit$K)) {
+    idx <- which(comp == k)
+    if (!length(idx)) next
+    U <- chol(fit$Sigma[[k]])
+    Z <- matrix(stats::rnorm(length(idx) * d), ncol = d)
+    out[idx, ] <- sweep(Z %*% U, 2L, fit$mu[k, ], "+")
+  }
+  colnames(out) <- colnames(fit$mu)
+  list(X = out, component = comp)
 }
