@@ -2,13 +2,13 @@
 
 A from-scratch Gaussian Mixture Model (GMM), fit by Expectation-Maximization
 (EM), applied to intensive longitudinal data from the BBRF study of adolescents
-with bipolar disorder. The model discovers latent daily *psychophysiological
-states* from continuous mood, actigraphy-sleep, and go/no-go cognition features;
+with bipolar disorder. The model discovers latent daily psychophysiological
+states from continuous mood, actigraphy-derived sleep, and go/no-go cognition features;
 those states are then characterized by their suicidal-ideation profiles and
 analyzed dynamically across each person's 30 days
 
-This is the final project for an ML course, so the learning algorithm is
-**implemented entirely from scratch** (`R/gmm_em.R`): the Gaussian log-density,
+This is my final project for BMI 643, so the learning algorithm is
+implemented entirely from scratch (`R/gmm_em.R`): the Gaussian log-density,
 E-step responsibilities, M-step updates, observed-data log-likelihood, BIC/ICL model
 selection, and multi-restart initialization are all hand-rolled. No mixture-model
 package (e.g., mclust, mixtools, flexmix, etc.) is used
@@ -22,11 +22,11 @@ relate" question); the per-person sequence of state assignments over days
 recovers the dynamical/trajectory view (state dwell, switching, and Scheffer-style
 early-warning signals before transitions into high-SI states)
 
-## Data safety (read before touching data)
+## A note on the data
 
 This study contains identifiable, IRB-protected daily suicide/self-harm reports
 and wearable data. **No participant-level data may ever be committed.** The entire
-`data/`, `results/`, and `figures/` trees are git-ignored. Place downloaded study
+`data/`, `results/`, and `figures/` trees are git-ignored in multile places. Place downloaded study
 files under `data/raw/` locally; the pipeline writes the analytic table to
 `data/processed/` (also ignored). Commit only code and the config
 
@@ -62,11 +62,3 @@ Rscript analysis/01_build_dataset.R
 # 4. Render the analysis
 Rscript -e 'rmarkdown::render("analysis/02_gmm_states.Rmd")'
 ```
-
-## Status
-
-- `src/gmm_em.R` + `tests/test_gmm_em.R`: **verified** (recovers known means,
-  weights, and the true K on simulated data)
-- `analysis/01_build_dataset.R`: **v1, not yet run on the real files.** Confirm exact
-  column names/encodings and the SleepBD27 (two-part) / SleepBD08 (no-actigraphy)
-  edge cases on first local run; validate the sleep/nap timing correction first
