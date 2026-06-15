@@ -3,7 +3,7 @@ title: "BBRF GMM: Latent Daily Psychophysiological States & Suicide Risk"
 output:
   html_document:
     toc: true
-    toc_depth: 2
+    toc_depth: 3
     number_sections: false
 params:
   profile: "default"
@@ -53,7 +53,7 @@ Goal is to discover latent daily states from a small set of continuous
 psychophysiological features (i.e., mood, actigraphy derived sleep,
 go/no-go cognition) by fitting a Gaussian Mixture Model via EM, then
 characterize those states by their suicidal-ideation profiles and
-analyze how individuals move among them over time.
+analyze how individuals move among them over time
 
 **This will occur in three stages.**
 
@@ -65,7 +65,7 @@ analyze how individuals move among them over time.
     comparing BIC, AIC, and ICL (with classification entropy and the
     smallest mixing weight as degeneracy diagnostics), a Kneedle knee, a
     marginal density-fit comparison, and the person x state artifact
-    check (never a single minimum)
+    check
 3.  *States + dynamics.* Overlay SI/SB onto states; decode per-person
     state sequences; relate early-warning indicators (variance, lag-1
     autocorrelation) to transitions into high-SI states
@@ -77,7 +77,7 @@ analyze how individuals move among them over time.
 #1.1 Configured features. The FULL set (`feat`) drives Stage-1 EDA and the
 #    documented commission check; the MODELING set (`feat_model`) drops any
 #    features flagged for documented exclusion (e.g., commission_elogit) so they
-#    never enter the mixture, while their evidence is retained.
+#    never enter the mixture
 feat <- cfg$features
 feat_excl <- if (!is.null(cfg$gmm$exclude_from_mixture)) unlist(cfg$gmm$exclude_from_mixture) else character(0)
 feat_model <- setdiff(feat, feat_excl)
@@ -85,7 +85,7 @@ stopifnot(all(feat %in% names(daily)))
 
 #1.2 Complete-case on the MODELING features (so an excluded feature's missingness
 #    can't shrink N), while carrying the excluded feature(s) + overlays for
-#    documentation and Stage-3 characterization.
+#    documentation and Stage-3 characterization
 model_df <- daily |>
   dplyr::select(subject, day, dplyr::all_of(feat),
                 dplyr::any_of(c(cfg$overlay$primary, cfg$overlay$secondary, cfg$overlay$rare))) |>
@@ -123,7 +123,7 @@ ggplot(feat_long, aes(x = value)) +
   labs(title = "Feature distributions (native units)", x = NULL, y = "Person-days") +
   theme_hw()
 
-#1a.3 Numeric shape summary, incl. share sitting exactly at the floor (the spike)
+#1a.3 Numeric shape summary, incl. share sitting exactly at the floor
 feat_long |>
   dplyr::group_by(feature) |>
   dplyr::summarise(
@@ -163,7 +163,7 @@ nice_tbl(uni_summary, caption = "Univariate 2-component summaries", digits = 3)
 
 ```
 
-## Commission: documented exclusion check
+## Commission error documented exclusion check
 
 Go/no-go commission-error rate is a theoretically central index of
 inhibitory control, and we retained it as a candidate state feature. But
@@ -174,9 +174,9 @@ variance. The check below fits the mixture with commission included and
 shows the consequence, i.e., commission dominates feature discrimination
 only by spawning near-zero-variance components anchored at the
 error-rate floor. In other words, it sorts days into "any errors vs
-none" rather than indexing graded control. On that pre-registered basis
-we exclude it from the mixture and retain it as a descriptive overlay on
-the mood/sleep states. The evidence is kept here for the writeup and 
+none" rather than indexing graded control. On that basiswe exclude it 
+from the mixture and retain it as a descriptive overlay on the
+mood/sleep states. The evidence is kept here for the writeup and 
 posterity
 
 ```{r commission_documented_exclusion, warning = FALSE}
@@ -194,7 +194,7 @@ if ("commission_elogit" %in% feat) {
                         max_iter = cfg$gmm$max_iter, tol = cfg$gmm$tol,
                         ridge = cfg$gmm$ridge, seed = cfg$gmm$seed)
 
-  #C.2 Commission dominates discrimination (via near-zero within-component variance)
+  #C.2 Commission dominates discrimination via near-zero within-component variance
   nice_tbl(gmm_feature_discrimination(fit_doc, X_doc),
            caption = glue::glue("Commission INCLUDED (K = {k_doc}): per-feature discrimination ",
                                "(commission's ratio is inflated by a near-zero-variance spike)"))
@@ -250,7 +250,7 @@ nice_tbl(sel_diag |> dplyr::select(K, min_weight, min_state_days, degenerate),
                               "{min_days_floor} effective person-days are degenerate"),
          digits = 3)
 
-#2.0c Non-degenerate BIC/ICL minima (the defensible selection targets)
+#2.0c Non-degenerate BIC/ICL minima
 ok <- !sel_diag$degenerate
 bic_k_ok <- sel_diag$K[ok][which.min(sel_diag$bic[ok])]
 icl_k_ok <- sel_diag$K[ok][which.min(sel_diag$icl[ok])]
@@ -318,12 +318,11 @@ message(glue::glue(
 # validity indices are DISTANCE-based (WSS elbow, silhouette), an objective
 # entirely independent of the likelihood-based BIC/ICL/CV used for the GMM. If
 # the distance view also favours a small K near 4, that is convergent evidence
-# from a different criterion; if not, it is an honest robustness caveat
-
+# from a different criterion; if not, it is a robustness caveat
 km_k <- 2:10
 set.seed(cfg$gmm$seed)
 
-#2.4b.1 Fit k-means at each K (many restarts via nstart for stable WSS)
+#2.4b.1 Fit k-means at each K with many restarts via nstart for stable WSS
 km_fits <- lapply(km_k, function(k)
   stats::kmeans(X, centers = k, nstart = 25, iter.max = 100))
 names(km_fits) <- km_k
@@ -346,7 +345,7 @@ avg_silhouette <- function(Xmat, cl) {
   mean(sil)
 }
 
-#2.4b.3 Subsample cap for the silhouette distance matrix (reproducible)
+#2.4b.3 Subsample cap for the silhouette distance matrix
 m_cap <- min(nrow(X), 600L)
 sil_idx <- sample(seq_len(nrow(X)), m_cap)
 
@@ -405,7 +404,7 @@ message(glue::glue("GMM vs k-means agreement at K={chosen_k}: adjusted Rand inde
 
 #2.4.1 PLOT A: per-feature component densities, one curve PER STATE, over the
 #      data histogram. Reads as: "for this feature, here is each state's density
-#      and where it sits." The summed (mixture) density is the dashed envelope
+#      and where it sits."
 comp_dens <- purrr::map_dfr(colnames(X),
   function(f) gmm_component_density(best, X, f))
 
@@ -509,10 +508,9 @@ ggplot(fing_long, aes(x = z_mean, y = feature, colour = state)) +
 # densities we project to 2-D. PCA is the faithful choice: it is a LINEAR
 # projection, so each fitted component's mean and covariance map exactly onto the
 # plane (mu -> V'mu, Sigma -> V'Sigma V, V = top-2 loadings). We are NOT
-# refitting in 2-D, just viewing the ACTUAL 5-D fit from a different angle.
+# refitting in 2-D, just viewing the 5-D fit from a different angle
 
-#2.6b.1 PCA on the standardized modeling matrix the GMM was fit on (already
-#       z-scored, so prcomp neither centers again nor rescales)
+#2.6b.1 PCA on the standardized modeling matrix the GMM was fit on
 pca <- stats::prcomp(X, center = FALSE, scale. = FALSE)
 V <- pca$rotation[, 1:2]
 var_pc <- round(100 * (pca$sdev^2 / sum(pca$sdev^2))[1:2], 1)
@@ -526,7 +524,7 @@ Sig_proj <- lapply(best$Sigma, function(S) t(V) %*% S %*% V)
 #2.6b.3 Covariance ellipse FROM SCRATCH: eigen-decompose the projected 2x2
 #       covariance; axis half-lengths = sqrt(eigenvalue) * sqrt(qchisq(level, 2))
 #       oriented by the eigenvectors. This contour encloses `level` of that
-#       Gaussian's mass (verified: simulated draws fall inside at the nominal rate)
+#       Gaussian's mass
 ellipse_pts <- function(mu2, S2, level = 0.68, n = 80) {
   eg <- eigen(S2, symmetric = TRUE)
   rad <- sqrt(stats::qchisq(level, df = 2))
@@ -588,7 +586,7 @@ The primary model is fit on raw (i.e., across-sample standardized) person-days,
 so a fair objection is that the states might be sorting people (e.g., chronically
 high-distress vs chronically euthymic individuals) rather than capturing
 within-person day-to-day shifts; the latter being the dynamical-systems
-claim we actually want to make. The artifact check already shows no state is one
+claim we actually are interested in. The artifact check already shows no state is one
 person's days, & this sensitivity goes further by asking whether the same state
 structure survives when all stable between-person differences are removed
 
@@ -603,8 +601,7 @@ and (c) the day-level assignments agree with the primary solution (adjusted Rand
 index). We do not expect identical partitions bc centering deliberately moves a
 chronically-depressed person's average day off the high-distress state, so the
 scientific question is whether a recognizable distress/euthymic structure
-re-emerges from purely within-person variation, which is a claim the
-dynamical framing needs
+re-emerges from purely within-person variation
 
 ```{r centered_icc, warning = FALSE}
 
@@ -993,6 +990,44 @@ ggplot(seq_df, aes(day, factor(subject), fill = factor(state))) +
        x = "Study day", y = NULL) +
   theme_hw() + theme(axis.text.y = element_text(size = 6))
 
+#3.2.2a Sequence descriptives for the raster: switch rate (fraction of
+#       consecutive-day pairs that change state), states visited per person, and
+#       transitions per person. These quantify the "rapid reconfiguration" the
+#       raster shows. Computed over consecutive observed days only
+switch_rate <- with(seq_df[seq_df$consecutive, ],
+                    mean(state != prev_state))
+
+per_person_seq <- seq_df |>
+  dplyr::group_by(subject) |>
+  dplyr::summarise(
+    n_days = dplyr::n(),
+    states_visited = dplyr::n_distinct(state),
+    transitions = sum(consecutive & (state != prev_state), na.rm = TRUE),
+    .groups = "drop")
+
+seq_summary <- tibble::tibble(
+  metric = c("Switch rate (consecutive-day pairs changing state)",
+             "States visited per person (median [range])",
+             "States visited per person (mean)",
+             "Transitions per person (median [range])",
+             "Transitions per person (mean)"),
+  value = c(
+    sprintf("%.1f%%", 100 * switch_rate),
+    sprintf("%d [%d-%d]", stats::median(per_person_seq$states_visited),
+            min(per_person_seq$states_visited), max(per_person_seq$states_visited)),
+    sprintf("%.1f", mean(per_person_seq$states_visited)),
+    sprintf("%d [%d-%d]", stats::median(per_person_seq$transitions),
+            min(per_person_seq$transitions), max(per_person_seq$transitions)),
+    sprintf("%.1f", mean(per_person_seq$transitions))))
+
+nice_tbl(seq_summary, caption = "Per-person state-sequence descriptives (Figure: state raster)")
+
+message(glue::glue(
+  "Sequence descriptives: switch rate = {round(100*switch_rate,1)}%; ",
+  "states/person median {stats::median(per_person_seq$states_visited)} ",
+  "(range {min(per_person_seq$states_visited)}-{max(per_person_seq$states_visited)}); ",
+  "transitions/person mean {round(mean(per_person_seq$transitions),1)}."))
+
 #3.2.2b Assignment confidence: mean max-responsibility per state. Values near 1
 #       mean confident hard assignments (well-separated states); values near 1/K
 #       mean fuzzy assignments, in which case rapid day-to-day "switching" is
@@ -1020,8 +1055,7 @@ nice_tbl(conf_df,
 #       CONTINUOUS metric (si_bother) as a size/opacity dot overlay; (B) the
 #       BINARY events on one panel, distinguished by SHAPE. Deliberately omitted:
 #       si_severity (near-collinear with si_bother, and is the same construct, coarser
-#       scale) and ACTIVESIWITHINTENT (~constant near 1 across all states in the
-#       overlay table, so it carries no discriminating signal here)
+#       scale) and ACTIVESIWITHINTENT
 si_cont_metric <- "si_bother"
 si_event_vars  <- intersect(c("si_any", "SELFHARM", "SUICIDEATTEMPT"), names(seq_df))
 
@@ -1116,7 +1150,7 @@ edges <- trans |>
     x0t = x0 + 0.16 * cos(a0), y0t = y0 + 0.16 * sin(a0),   # trim off node centers
     x1t = x1 + 0.16 * cos(a1), y1t = y1 + 0.16 * sin(a1))
 
-#3.2.3c Quadratic-Bezier polylines for each curved edge (base R; no igraph dep)
+#3.2.3c Quadratic-Bezier polylines for each curved edge
 bez <- function(p0, p1, p2, n = 30) {
   t <- seq(0, 1, length.out = n)
   (1 - t)^2 * p0 + 2 * (1 - t) * t * p1 + t^2 * p2
@@ -1184,6 +1218,22 @@ ggplot(trans, aes(factor(to), factor(from), fill = prob)) +
        x = "To state (day t+1)", y = "From state (day t)") +
   theme_hw()
 
+#3.2.3f Persistence summary: diagonal of the transition matrix (probability a
+#       state is followed by itself the next day) + the single most likely
+#       destination when it does change
+persist_tbl <- trans |>
+  dplyr::group_by(from) |>
+  dplyr::summarise(
+    self_transition = prob[to == from][1],
+    top_exit = to[which.max(ifelse(to == from, -Inf, prob))],
+    top_exit_prob = max(ifelse(to == from, -Inf, prob)),
+    .groups = "drop") |>
+  dplyr::mutate(self_transition = round(self_transition, 2),
+                top_exit_prob = round(top_exit_prob, 2))
+
+nice_tbl(persist_tbl,
+         caption = "State persistence (self-transition probability) and most likely exit destination")
+
 ```
 
 ```{r state_dwell, warning = FALSE}
@@ -1211,7 +1261,7 @@ nice_tbl(dwell, caption = "Dwell time per state (lengths of consecutive-day runs
 
 ### How to read the critical-slowing-down (CSD) analysis
 
-The theory (Scheffer): a system nearing a tipping point loses resilience, and after
+The Scheffer theory: a system nearing a tipping point loses resilience, and after
 any small perturbation it drifts back to baseline more slowly. In daily data
 that loss of resilience leaves two statistical fingerprints in the days just
 before a transition: (1) rising variance, where the system wanders further before
@@ -1370,4 +1420,3 @@ if (ew_ok) ggplot(ew_long, aes(window, value, fill = window)) +
     hypothesis-generating preliminary evidence for the F31, not a
     confirmatory test of rising variance / autocorrelation before
     high-SI transitions
-

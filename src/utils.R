@@ -158,7 +158,7 @@ gmm_state_profile <- function(fit, X) {
   out <- tibble::as_tibble(round(native, 2))
   out$state <- factor(seq_len(nrow(out)))
   out$weight <- round(fit$weights, 3)
-  out$n_days <- as.integer(round(fit$weights * nrow(X)))
+  out$n_days <- as.integer(tabulate(gmm_map_assign(fit), nbins = nrow(fit$mu)))
   dplyr::relocate(out, state, weight, n_days)
 }
 
